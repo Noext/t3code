@@ -781,3 +781,20 @@ export const ForgejoIcon: Icon = (props) => (
     </g>
   </svg>
 );
+
+/**
+ * Pi ships no redistributable vector mark, so this is a neutral lower-case pi
+ * drawn from strokes and tinted with `currentColor` — the provider name, not a
+ * copy of someone else's branding.
+ */
+export const PiIcon: Icon = (props) => (
+  <svg viewBox="0 0 32 32" fill="none" aria-hidden="true" {...props}>
+    <path
+      d="M5 8.5h22M11.5 8.5v17M21 8.5v13.5a4.5 4.5 0 0 0 6 4"
+      stroke="currentColor"
+      strokeWidth="3.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);

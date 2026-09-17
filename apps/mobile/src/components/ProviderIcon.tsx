@@ -73,6 +73,22 @@ export function ProviderIcon(props: ProviderIconProps) {
     );
   }
 
+  if (props.provider === "pi") {
+    // The same lower-case pi mark the web client uses: two stems and a bar,
+    // drawn with strokes so it stays legible at 16px.
+    return (
+      <Svg width={size} height={size} viewBox="0 0 32 32" fill="none">
+        <Path
+          d="M5 8.5h22M11.5 8.5v17M21 8.5v13.5a4.5 4.5 0 0 0 6 4"
+          stroke={mono}
+          strokeWidth={3.5}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </Svg>
+    );
+  }
+
   // codex (and unknown drivers)
   return (
     <Svg width={size} height={size} viewBox="0 0 256 260" fill="none">

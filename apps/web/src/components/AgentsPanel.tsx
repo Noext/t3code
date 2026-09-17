@@ -19,6 +19,7 @@ import type {
 import {
   formatSubagentModelLabel,
   formatSubagentTokenCount,
+  formatWorkflowRunLabel,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Bot, Braces, Check, ChevronDown, ChevronRight, X } from "lucide-react";
@@ -355,11 +356,13 @@ function PhaseSection({
         {phase.state === "done" ? <Check aria-hidden className="size-3" /> : null}
         <span>{phase.title}</span>
         <span className="font-normal normal-case text-muted-foreground/70">
-          {phase.state === "pending" && phase.members.length === 0
-            ? "pending"
-            : phase.state === "done"
-              ? `${phase.settledCount} done`
-              : `${phase.activeCount} active · ${phase.settledCount} done`}
+          {phase.state === "skipped"
+            ? "not reached"
+            : phase.state === "pending" && phase.members.length === 0
+              ? "pending"
+              : phase.state === "done"
+                ? `${phase.settledCount} done`
+                : `${phase.activeCount} active · ${phase.settledCount} done`}
         </span>
         {!open && phase.members.length > 0 ? (
           <span className="ml-auto flex items-center gap-0.5">
@@ -401,9 +404,7 @@ function ExpandedWorkflowSection({
     <section className="rounded-lg border border-border/50 bg-card/30 p-1.5">
       <div className="flex items-center gap-2 px-1.5 pt-0.5 text-[.65rem] font-medium uppercase tracking-wider text-muted-foreground">
         <StatusDot status={group.workflow.status} />
-        <span className="min-w-0 truncate">
-          {group.workflow.workflowName ?? group.workflow.title}
-        </span>
+        <span className="min-w-0 truncate">{formatWorkflowRunLabel(group.workflow)}</span>
         {canShowScript ? (
           <button
             type="button"
@@ -483,9 +484,7 @@ function CollapsedWorkflowSection({
         aria-expanded={false}
       >
         <StatusDot status={failed > 0 ? "failed" : group.workflow.status} />
-        <span className="truncate text-sm">
-          {group.workflow.workflowName ?? group.workflow.title}
-        </span>
+        <span className="truncate text-sm">{formatWorkflowRunLabel(group.workflow)}</span>
         <span className="ml-auto flex items-center gap-1.5 font-mono text-[.7rem] text-muted-foreground/80">
           {failed > 0 ? <span className="text-destructive-foreground">{failed} failed</span> : null}
           <span>{members.length} agents</span>
