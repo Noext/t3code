@@ -42,6 +42,7 @@ import {
   emptyAgentPanelModel,
   formatSubagentModelLabel,
   formatSubagentTokenCount,
+  formatWorkflowRunLabel,
   isActiveSubagentStatus,
   isTerminalSubagentStatus,
 } from "@t3tools/client-runtime/state/subagentRuntime";
@@ -4507,8 +4508,7 @@ const AgentSpawnRow = memo(function AgentSpawnRow(props: {
   });
   const { live, lead } = summary;
   const failed = summary.tone === "failed";
-  const workflowName =
-    workflowGroup?.workflow.workflowName ?? workflowGroup?.workflow.title ?? null;
+  const workflowLabel = workflowGroup ? formatWorkflowRunLabel(workflowGroup.workflow) : null;
   const toggleExpanded = () => {
     props.onToggleEntry?.(expanded);
     onToggleSpawnRow(workEntry.id, !expanded);
@@ -4523,7 +4523,7 @@ const AgentSpawnRow = memo(function AgentSpawnRow(props: {
         className="flex cursor-pointer select-none rounded-md text-left transition-colors hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
       >
         <LiveActivityRow
-          label={workflowName ? `${lead} · ${workflowName}` : lead}
+          label={workflowLabel ? `${lead} · ${workflowLabel}` : lead}
           iconName="bot"
           active={live && props.active !== false}
           failed={failed}

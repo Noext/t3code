@@ -56,6 +56,7 @@ import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -63,6 +64,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -80,8 +82,14 @@ import {
 } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import { buildPiPromptImages } from "../pi/PiImageAttachments.ts";
+import {
+  emptyPiWorkflowTracker,
+  reconcilePiWorkflowRuns,
+  type PiWorkflowEmission,
+} from "../pi/PiWorkflowProgress.ts";
 import * as PiRpcTransport from "../pi/PiRpcTransport.ts";
 import type { PiRpcEvent, PiRpcTransportShape } from "../pi/PiRpcTransport.ts";
+import { defaultPiWorkflowStoreRoot, makePiWorkflowStore } from "../pi/PiWorkflowStore.ts";
 import {
   piDeltaStreamKind,
   piNotifyMessage,
@@ -261,6 +269,14 @@ export interface PiAdapterOptions {
       >)
     | undefined;
   readonly nativeEventLogger?: PiNativeEventLogger | undefined;
+  /**
+   * Root of the Pi dynamic-workflows run store. Defaults to the operator's
+   * `~/.pi/workflows`; tests point it at a fixture directory. This is a test
+   * seam, not user config.
+   */
+  readonly workflowStoreRoot?: string | undefined;
+  /** Sweep cadence for the workflow store; tests shorten it. */
+  readonly workflowSweepIntervalMs?: number | undefined;
 }
 
 /** Subset of `EventNdjsonLogger` the adapter writes raw protocol records to. */
@@ -437,6 +453,91 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         Effect.map((lock) => [lock, new Map(current).set(threadId, lock)] as const),
       );
     }).pipe(Effect.flatMap((lock) => lock.withPermit(task)));
+
+  //
+  // Pi workflow runs (dynamic workflows, `@quintinshaw/pi-dynamic-workflows`).
+  //
+  // The extension draws its live progress in a TUI panel that RPC mode cannot
+  // serve, so the only live source is the run store it writes to disk. This
+  // reader is off the turn path by construction: it is a spaced sweep forked
+  // into the thread's session scope, it never blocks a turn, and every failure
+  // is swallowed and logged so a foreign, unversioned format can only make the
+  // feature invisible, never break a thread.
+  //
+  const workflowStore = yield* makePiWorkflowStore({
+    homeDir: options.workflowStoreRoot ?? defaultPiWorkflowStoreRoot(options.environment),
+  });
+  // A non-positive or non-finite cadence would be a hot loop over the store.
+  const configuredSweepIntervalMs = options.workflowSweepIntervalMs ?? 3_000;
+  const workflowSweepInterval = Duration.millis(
+    Number.isFinite(configuredSweepIntervalMs) && configuredSweepIntervalMs >= 1
+      ? configuredSweepIntervalMs
+      : 3_000,
+  );
+
+  /** Stamp one reconciled emission and publish it on the provider stream. */
+  const emitWorkflowEmission = (threadId: ThreadId, emission: PiWorkflowEmission) =>
+    Effect.gen(function* () {
+      const eventStamp = yield* stamp;
+      const base = {
+        eventId: eventStamp.eventId,
+        createdAt: eventStamp.createdAt,
+        provider: PROVIDER,
+        providerInstanceId: options.instanceId,
+        threadId,
+      };
+      switch (emission.type) {
+        case "task.started":
+          return yield* emit({ ...base, type: "task.started", payload: emission.payload });
+        case "task.progress":
+          return yield* emit({ ...base, type: "task.progress", payload: emission.payload });
+        case "task.updated":
+          return yield* emit({ ...base, type: "task.updated", payload: emission.payload });
+        case "task.completed":
+          return yield* emit({ ...base, type: "task.completed", payload: emission.payload });
+      }
+    });
+
+  /**
+   * Sweeps the thread's workflow-store project directory once per cadence. The
+   * tracker is per session (not per adapter) so one thread's sweep can never
+   * mistake another thread's run for a vanished one. A failed sweep is logged
+   * and skipped with the tracker untouched: "I could not read this" must never
+   * reach a thread as "this ended".
+   */
+  const startWorkflowSweep = (context: SessionContext) =>
+    Effect.gen(function* () {
+      let tracker = emptyPiWorkflowTracker();
+      const sweep = Effect.gen(function* () {
+        const listing = yield* workflowStore.listRunsForSession({
+          cwd: context.cwd,
+          sessionIds: [context.sessionId],
+        });
+        const reconciled = reconcilePiWorkflowRuns({
+          runs: listing.runs,
+          unresolvedRunIds: listing.unresolvedRunIds,
+          tracker,
+        });
+        tracker = reconciled.tracker;
+        for (const emission of reconciled.emissions) {
+          yield* emitWorkflowEmission(context.threadId, emission);
+        }
+      }).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterrupts(cause),
+          (cause) =>
+            Effect.logDebug("Pi workflow sweep failed.", {
+              threadId: context.threadId,
+              cause,
+            }),
+        ),
+      );
+      yield* sweep.pipe(
+        Effect.repeat(Schedule.spaced(workflowSweepInterval)),
+        Effect.forkIn(context.scope),
+        Effect.asVoid,
+      );
+    });
 
   const requestError = (threadId: ThreadId, method: string, cause: unknown) =>
     new ProviderAdapterRequestError({
@@ -1390,6 +1491,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           };
           context = running;
           sessions.set(input.threadId, running);
+
+          yield* startWorkflowSweep(running);
 
           yield* Stream.runForEach(transport.events, (record) => handleEvent(running, record)).pipe(
             Effect.catchCause(() => Effect.void),

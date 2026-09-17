@@ -686,8 +686,13 @@ export interface AgentPanelWorkflowGroup {
     readonly index: number;
     readonly title: string;
     readonly members: ReadonlyArray<RuntimeSubagent>;
-    /** done = every member settled (success or error); running = any active. */
-    readonly state: "pending" | "running" | "done";
+    /**
+     * done = every member settled (success or error); running = any active.
+     * skipped = the run is over (terminal coordinator) and this phase never
+     * got a member: the rail must not keep advertising work that will never
+     * arrive. A paused run is resumable, so its unreached phases stay pending.
+     */
+    readonly state: "pending" | "running" | "done" | "skipped";
     readonly activeCount: number;
     readonly settledCount: number;
   }>;
@@ -785,6 +790,14 @@ export function deriveAgentPanelModel({
           })();
 
     const knownPhaseIndices = new Set(knownPhases.map((phase) => phase.index));
+    // A terminal coordinator means the run is over, nothing in it is still
+    // waiting to start. Pi (like any multi-phase workflow) declares its whole
+    // phase list up front, so a run that completed, failed, or was stopped
+    // before a phase began leaves that phase with no members — deriving phase
+    // state from membership alone then painted a finished run's last phase
+    // "pending" forever. A paused run is NOT terminal: it is resumable, so its
+    // unreached phases must keep reading pending for the rail to advance.
+    const runFinished = isTerminalSubagentStatus(workflow.status);
     const phases = knownPhases.map((phase) => {
       const phaseMembers = workflowMembers
         .filter((member) => member.phaseIndex === phase.index)
@@ -798,14 +811,23 @@ export function deriveAgentPanelModel({
       const settledCount = phaseMembers.filter((member) =>
         isTerminalSubagentStatus(member.status),
       ).length;
-      const state: "pending" | "running" | "done" =
+      const state: "pending" | "running" | "done" | "skipped" =
         phaseMembers.length === 0
-          ? "pending"
+          ? runFinished
+            ? "skipped"
+            : "pending"
           : activeCount > 0
-            ? "running"
+            ? // The run is over even if a member is still idle: the coordinator
+              // having settled is what decides, and a finished run cannot leave
+              // a live phase behind.
+              runFinished
+              ? "done"
+              : "running"
             : settledCount === phaseMembers.length
               ? "done"
-              : "pending";
+              : runFinished
+                ? "skipped"
+                : "pending";
       return {
         index: phase.index,
         title: phase.title,
@@ -859,6 +881,46 @@ export function deriveAgentPanelModel({
     hasAgents: true,
     liveCount: runningCount + waitingCount,
   };
+}
+
+/**
+ * The short, stable tail of a workflow run id, for telling two runs of the
+ * same workflow apart. Pi's writer names a run `<slug>-<ts36>-<rand>`
+ * (`generateRunId` in @quintinshaw/pi-dynamic-workflows), so the last two
+ * hyphen-separated segments are exactly the part that differs between two runs
+ * of one workflow: the slug identifies the workflow, the timestamp plus random
+ * tail identifies the run. `null` when there is nothing usable (missing or
+ * hyphen-only id), so a caller degrades to the bare name rather than rendering
+ * an empty or broken label.
+ */
+export function workflowRunSuffix(runId: string | null | undefined): string | null {
+  const trimmed = runId?.trim();
+  if (!trimmed) return null;
+  const segments = trimmed.split("-").filter((segment) => segment.length > 0);
+  if (segments.length === 0) return null;
+  // Whole id when it has fewer than two usable segments. Cap the tail so an
+  // un-hyphenated foreign id cannot blow up a one-line card label; Pi's own
+  // tail is 6-7 chars of base36 plus the separator.
+  const suffix = segments.slice(-2).join("-");
+  return suffix.length > 32 ? suffix.slice(-32) : suffix;
+}
+
+/**
+ * The workflow card's one-line identity: the workflow name plus the run's own
+ * suffix (`pi_workflow_phase_pending_fix · mu5n6tcx-i253rw`). Two runs of the
+ * same workflow share the name, so without the suffix the card renders the
+ * same label twice. When the name already carries the suffix (the interrupted
+ * fallback sets the name to the full run id) the suffix is not repeated.
+ */
+export function formatWorkflowRunLabel(workflow: {
+  readonly workflowName: string | null;
+  readonly title: string;
+  readonly runHandles: SubagentRunHandles | null;
+}): string {
+  const name = workflow.workflowName ?? workflow.title;
+  const suffix = workflowRunSuffix(workflow.runHandles?.runId);
+  if (!suffix || name.includes(suffix)) return name;
+  return `${name} · ${suffix}`;
 }
 
 /**

@@ -5,6 +5,9 @@ import {
   foldSubagentActivities,
   formatSubagentModelLabel,
   formatSubagentTokenCount,
+  formatWorkflowRunLabel,
+  isTerminalSubagentStatus,
+  workflowRunSuffix,
 } from "./subagentRuntime.ts";
 
 let sequence = 0;
@@ -504,6 +507,268 @@ describe("deriveAgentPanelModel", () => {
     expect(ids.at(-1)).toBe("capped-100");
   });
 
+  // Real shapes below read from the operator's own Pi run store
+  // (~/.pi/workflows/projects/t3code-d2f7aa1bf007/runs). A Pi run declares its
+  // whole phase list up front and a later phase only gains members when the
+  // run reaches it, so "a phase with no members" is the ordinary state of any
+  // phase a run stopped or failed before reaching.
+  const piRunRows = (options: {
+    readonly runId: string;
+    readonly phases: ReadonlyArray<string>;
+    readonly currentPhase: string;
+    readonly at: string;
+  }) => {
+    const started = activity(
+      "task.started",
+      {
+        taskId: options.runId,
+        taskType: "local_workflow",
+        title: "pi_workflow",
+        workflowName: "pi_workflow",
+        runHandles: { runId: options.runId },
+      },
+      options.at,
+    );
+    const phases = activity(
+      "task.progress",
+      {
+        taskId: options.runId,
+        phases: options.phases.map((title, index) => ({ index, title })),
+        summary: options.currentPhase,
+      },
+      new Date(Date.parse(options.at) + 1_000).toISOString(),
+    );
+    return { started, phases };
+  };
+  const piMemberRow = (
+    runId: string,
+    slot: number,
+    label: string,
+    phase: string,
+    phaseIndex: number,
+    status: string,
+    at: string,
+  ) =>
+    activity(
+      "task.progress",
+      {
+        taskId: `${runId}:wf:${slot}`,
+        title: label,
+        status,
+        parentAgentId: runId,
+        agentIndex: slot,
+        phaseIndex,
+        phaseTitle: phase,
+        timelineBypass: true,
+      },
+      at,
+    );
+
+  it("a finished run leaves no phase pending", () => {
+    // pi-workflow-sidebar-recon-mu5iej8f-dcgowe.json: status "aborted",
+    // phases ["Recon","Design"], currentPhase "Recon", and all four agents
+    // (three done, one skipped) in Recon. The run ended during Recon, so
+    // Design never received a member and the rail showed it "pending" forever.
+    const runId = "pi-workflow-sidebar-recon-mu5iej8f-dcgowe";
+    const { started, phases } = piRunRows({
+      runId,
+      phases: ["Recon", "Design"],
+      currentPhase: "Recon",
+      at: "2026-09-17T12:32:00.000Z",
+    });
+    const aborted = fold([
+      started,
+      phases,
+      piMemberRow(runId, 1, "recon-store", "Recon", 0, "completed", "2026-09-17T12:40:00.000Z"),
+      piMemberRow(runId, 2, "recon-surface", "Recon", 0, "completed", "2026-09-17T12:41:00.000Z"),
+      piMemberRow(runId, 3, "recon-precedent", "Recon", 0, "completed", "2026-09-17T12:42:00.000Z"),
+      piMemberRow(runId, 4, "recon-adapter", "Recon", 0, "completed", "2026-09-17T12:43:00.000Z"),
+      // The server maps the run's "aborted" to task.completed/stopped and
+      // repeats the declared phase list on that terminal row.
+      activity(
+        "task.completed",
+        {
+          taskId: runId,
+          status: "stopped",
+          summary: "Workflow run stopped.",
+          phases: [
+            { index: 0, title: "Recon" },
+            { index: 1, title: "Design" },
+          ],
+        },
+        "2026-09-17T12:49:29.570Z",
+      ),
+    ]);
+
+    const model = deriveAgentPanelModel({ agents: aborted });
+    expect(isTerminalSubagentStatus(model.workflows[0]!.workflow.status)).toBe(true);
+    expect(model.workflows[0]!.phases.map((phase) => `${phase.title}:${phase.state}`)).toEqual([
+      "Recon:done",
+      "Design:skipped",
+    ]);
+  });
+
+  it("a mid-run workflow still shows phases it has not reached as pending", () => {
+    // pi-workflow-phase-pending-fix-mu5n6tcx-i253rw.json: status "running",
+    // phases ["Fix","Verify"], currentPhase "Fix", one running agent in Fix.
+    const runId = "pi-workflow-phase-pending-fix-mu5n6tcx-i253rw";
+    const { started, phases } = piRunRows({
+      runId,
+      phases: ["Fix", "Verify"],
+      currentPhase: "Fix",
+      at: "2026-09-17T14:46:00.000Z",
+    });
+    const running = fold([
+      started,
+      phases,
+      piMemberRow(runId, 1, "fix-phase-pending", "Fix", 0, "running", "2026-09-17T14:47:00.000Z"),
+    ]);
+
+    const model = deriveAgentPanelModel({ agents: running });
+    expect(model.workflows[0]!.phases.map((phase) => `${phase.title}:${phase.state}`)).toEqual([
+      "Fix:running",
+      "Verify:pending",
+    ]);
+  });
+
+  it("a terminal run resolves unreached phases, and a paused run keeps them pending", () => {
+    const finished = (status: "completed" | "failed", at: string) => {
+      const runId = `pi-workflow-${status}-run`;
+      const rows = piRunRows({
+        runId,
+        phases: ["Recon", "Design"],
+        currentPhase: "Recon",
+        at,
+      });
+      return fold([
+        rows.started,
+        rows.phases,
+        piMemberRow(runId, 1, "recon-store", "Recon", 0, "completed", "2026-09-17T11:01:00.000Z"),
+        activity(
+          "task.completed",
+          { taskId: runId, status, summary: "done" },
+          "2026-09-17T11:02:00.000Z",
+        ),
+      ]);
+    };
+
+    // A completed or failed run is over: the phase it never reached is not
+    // "pending", it is skipped.
+    for (const status of ["completed", "failed"] as const) {
+      expect(
+        deriveAgentPanelModel({
+          agents: finished(status, "2026-09-17T11:00:00.000Z"),
+        }).workflows[0]!.phases.map((phase) => `${phase.title}:${phase.state}`),
+      ).toEqual(["Recon:done", "Design:skipped"]);
+    }
+
+    // A paused run is resumable, so a phase it has not reached must stay
+    // pending: the rail still has to advance when the run resumes.
+    const pausedId = "pi-workflow-paused-run";
+    const pausedRows = piRunRows({
+      runId: pausedId,
+      phases: ["Recon", "Design"],
+      currentPhase: "Recon",
+      at: "2026-09-17T11:10:00.000Z",
+    });
+    const paused = fold([
+      pausedRows.started,
+      pausedRows.phases,
+      piMemberRow(pausedId, 1, "recon-store", "Recon", 0, "running", "2026-09-17T11:11:00.000Z"),
+      activity("task.updated", { taskId: pausedId, status: "idle" }, "2026-09-17T11:12:00.000Z"),
+    ]);
+    expect(
+      deriveAgentPanelModel({ agents: paused }).workflows[0]!.phases.map((phase) => phase.state),
+    ).toEqual(["running", "pending"]);
+  });
+
+  it("a phase whose only agent lands on the terminal sweep still renders done", () => {
+    // The operator's test_3_etapes run rebuilt as the server now emits it. The
+    // run is short enough that step3 is first visible on the same sweep that
+    // reports the run completed, so the member row and the completion arrive in
+    // one batch. The phase must read done, not skipped: the run DID run it.
+    const runId = "test-3-etapes-fixed";
+    const finished = fold([
+      activity("task.started", {
+        taskId: runId,
+        taskType: "local_workflow",
+        title: "test_3_etapes",
+        workflowName: "test_3_etapes",
+        phases: [
+          { index: 0, title: "Étape 1" },
+          { index: 1, title: "Étape 2" },
+        ],
+      }),
+      piMemberRow(runId, 1, "step1", "Étape 1", 0, "completed", "2026-09-17T14:44:43.534Z"),
+      piMemberRow(runId, 2, "step2", "Étape 2", 1, "running", "2026-09-17T14:44:44.830Z"),
+      // The terminal sweep restates step2 and introduces step3 (the fix).
+      piMemberRow(runId, 2, "step2", "Étape 2", 1, "completed", "2026-09-17T14:44:45.180Z"),
+      piMemberRow(runId, 3, "step3", "Étape 3", 2, "completed", "2026-09-17T14:44:47.257Z"),
+      activity(
+        "task.completed",
+        {
+          taskId: runId,
+          status: "completed",
+          phases: [
+            { index: 0, title: "Étape 1" },
+            { index: 1, title: "Étape 2" },
+            { index: 2, title: "Étape 3" },
+          ],
+        },
+        "2026-09-17T14:44:47.831Z",
+      ),
+    ]);
+
+    expect(
+      deriveAgentPanelModel({ agents: finished }).workflows[0]!.phases.map(
+        (phase) => `${phase.title}:${phase.state}`,
+      ),
+    ).toEqual(["Étape 1:done", "Étape 2:done", "Étape 3:done"]);
+  });
+
+  it("a terminal run whose last phase never emitted an agent resolves instead of pending", () => {
+    // The operator's stored rows (test-3-etapes-mu5n55b1-6cb2pp) before the
+    // server emitted final agent rows: the completion carries all three phases
+    // but step3 never appears. The run is over, so the phase must not advertise
+    // work that will never arrive — it resolves as skipped, never pending.
+    const runId = "test-3-etapes-mu5n55b1-6cb2pp";
+    const stored = fold([
+      activity("task.started", {
+        taskId: runId,
+        taskType: "local_workflow",
+        title: "test_3_etapes",
+        workflowName: "test_3_etapes",
+        phases: [
+          { index: 0, title: "Étape 1" },
+          { index: 1, title: "Étape 2" },
+        ],
+      }),
+      piMemberRow(runId, 1, "step1", "Étape 1", 0, "completed", "2026-09-17T14:44:44.830Z"),
+      piMemberRow(runId, 2, "step2", "Étape 2", 1, "running", "2026-09-17T14:44:44.830Z"),
+      activity(
+        "task.completed",
+        {
+          taskId: runId,
+          status: "completed",
+          phases: [
+            { index: 0, title: "Étape 1" },
+            { index: 1, title: "Étape 2" },
+            { index: 2, title: "Étape 3" },
+          ],
+        },
+        "2026-09-17T14:44:47.831Z",
+      ),
+    ]);
+
+    const phases = deriveAgentPanelModel({ agents: stored }).workflows[0]!.phases;
+    expect(phases.map((phase) => `${phase.title}:${phase.state}`)).toEqual([
+      "Étape 1:done",
+      "Étape 2:done",
+      "Étape 3:skipped",
+    ]);
+    expect(phases.some((phase) => phase.state === "pending")).toBe(false);
+  });
+
   it("a phase with only pending members never reads as running", () => {
     const pendingRoster = fold([
       activity("task.started", { taskId: "wf-9", taskType: "local_workflow" }),
@@ -550,6 +815,95 @@ describe("deriveAgentPanelModel", () => {
     const model = deriveAgentPanelModel({ agents: orphans });
     expect(model.workflows).toHaveLength(0);
     expect(model.directAgents.map((agent) => agent.id)).toEqual(["gone:wf:0"]);
+  });
+});
+
+describe("workflow run identity", () => {
+  // Real shape from the operator's Pi run store. The writer names a run
+  // `<workflow-slug>-<ts36>-<rand>` (generateRunId), and the workflow's own
+  // name is the slug spelled with underscores, so two runs of one workflow
+  // differ ONLY in the trailing timestamp-random tail: the name is identical
+  // and a card keyed on the name alone renders two indistinguishable rows.
+  const piWorkflowStarted = (runId: string, at: string) =>
+    activity(
+      "task.started",
+      {
+        taskId: runId,
+        taskType: "local_workflow",
+        title: "pi_workflow_phase_pending_fix",
+        workflowName: "pi_workflow_phase_pending_fix",
+        runHandles: { runId },
+      },
+      at,
+    );
+
+  it("distinguishes two runs of the same workflow by the id tail, not the name", () => {
+    const first = "pi-workflow-phase-pending-fix-mu5n6tcx-i253rw";
+    const second = "pi-workflow-phase-pending-fix-mu5n6td2-k9p1ab";
+    const model = deriveAgentPanelModel({
+      agents: fold([
+        piWorkflowStarted(first, "2026-09-17T14:46:00.000Z"),
+        piWorkflowStarted(second, "2026-09-17T15:10:00.000Z"),
+      ]),
+    });
+    const labels = model.workflows.map((group) => formatWorkflowRunLabel(group.workflow));
+    // Both keep the workflow name; only the tail tells them apart.
+    expect(labels.toSorted()).toEqual([
+      "pi_workflow_phase_pending_fix · mu5n6tcx-i253rw",
+      "pi_workflow_phase_pending_fix · mu5n6td2-k9p1ab",
+    ]);
+    expect(new Set(labels).size).toBe(2);
+  });
+
+  it("degrades to the bare name when the run id is missing or unusable", () => {
+    // Absent handles, blank ids (the fold drops whitespace anyway), and a
+    // hyphen-only id that yields no usable tail must all render the name
+    // alone — never a trailing/empty `·`.
+    const cases: ReadonlyArray<Record<string, unknown>> = [
+      {},
+      { runHandles: { runId: "-" } },
+      { runHandles: { runId: "   " } },
+      { runHandles: {} },
+    ];
+    for (const extra of cases) {
+      const agent = fold([
+        activity("task.started", {
+          taskId: "pi-workflow-nameless-run",
+          taskType: "local_workflow",
+          title: "audit-auth-flow",
+          workflowName: "audit-auth-flow",
+          ...extra,
+        }),
+      ])[0]!;
+      expect(formatWorkflowRunLabel(agent)).toBe("audit-auth-flow");
+    }
+  });
+
+  it("does not repeat the tail when the name already is the run id", () => {
+    // The server's interrupted fallback (buildInterrupted) sets
+    // workflowName to the run id; appending its own tail would stutter.
+    const runId = "pi-workflow-phase-pending-fix-mu5n6tcx-i253rw";
+    const agent = fold([
+      activity("task.updated", {
+        taskId: runId,
+        status: "interrupted",
+        taskType: "local_workflow",
+        title: runId,
+        workflowName: runId,
+        runHandles: { runId },
+      }),
+    ])[0]!;
+    expect(formatWorkflowRunLabel(agent)).toBe(runId);
+  });
+
+  it("keeps a short foreign id intact and only tail-truncates absurd ones", () => {
+    expect(workflowRunSuffix("run-1")).toBe("run-1");
+    expect(workflowRunSuffix("abcdef")).toBe("abcdef");
+    expect(workflowRunSuffix("  ")).toBeNull();
+    expect(workflowRunSuffix("-")).toBeNull();
+    expect(workflowRunSuffix(undefined)).toBeNull();
+    const long = "z".repeat(80);
+    expect(workflowRunSuffix(long)).toHaveLength(32);
   });
 });
 
@@ -889,5 +1243,106 @@ describe("nested agents vs subagent shells", () => {
       }),
     ]);
     expect(agents.map((agent) => agent.id)).toEqual(["nested-1"]);
+  });
+});
+
+describe("the operator's own persisted test_3_etapes streams", () => {
+  // Read verbatim (via t3-sqlite-state query) from
+  // .t3/userdata/state.sqlite -> projection_thread_activities. These are the
+  // rows the client actually rendered, so this is the regression that matters:
+  // the real run store declared fewer phases than the terminal row, and the
+  // last phase(s) never got a member row at all because the whole run crossed
+  // several phases between two 3 s sweeps. A memberless phase on a terminal run
+  // must not keep reading pending.
+  const started = (
+    taskId: string,
+    phases: ReadonlyArray<string>,
+    at: string,
+  ): OrchestrationThreadActivity =>
+    activity(
+      "task.started",
+      {
+        taskId,
+        taskType: "local_workflow",
+        detail: "test_3_etapes",
+        title: "test_3_etapes",
+        workflowName: "test_3_etapes",
+        phases: phases.map((title, index) => ({ index, title })),
+        runHandles: { runId: taskId },
+      },
+      at,
+    );
+  const member = (
+    taskId: string,
+    slot: number,
+    label: string,
+    phase: string,
+    phaseIndex: number,
+    status: string,
+    at: string,
+  ): OrchestrationThreadActivity =>
+    activity(
+      "task.progress",
+      {
+        taskId: `${taskId}:wf:${slot}`,
+        title: label,
+        detail: label,
+        status,
+        parentAgentId: taskId,
+        agentIndex: slot - 1,
+        phaseIndex,
+        phaseTitle: phase,
+        timelineBypass: true,
+      },
+      at,
+    );
+  const completed = (
+    taskId: string,
+    phases: ReadonlyArray<string>,
+    at: string,
+  ): OrchestrationThreadActivity =>
+    activity(
+      "task.completed",
+      {
+        taskId,
+        status: "completed",
+        title: "test_3_etapes",
+        taskType: "local_workflow",
+        workflowName: "test_3_etapes",
+        phases: phases.map((title, index) => ({ index, title })),
+        runHandles: { runId: taskId },
+      },
+      at,
+    );
+  const phaseStates = (rows: ReadonlyArray<OrchestrationThreadActivity>) => {
+    const model = deriveAgentPanelModel({ agents: foldSubagentActivities(rows) });
+    expect(model.workflows).toHaveLength(1);
+    expect(isTerminalSubagentStatus(model.workflows[0]!.workflow.status)).toBe(true);
+    return model.workflows[0]!.phases.map((phase) => `${phase.title}:${phase.state}`);
+  };
+
+  it("run mu5n55b1 (thread 33341374): step1 and step2 reported, step3 never did", () => {
+    const runId = "test-3-etapes-mu5n55b1-6cb2pp";
+    expect(
+      phaseStates([
+        // The start row knew only two of the three phases.
+        started(runId, ["Étape 1", "Étape 2"], "2026-09-17T14:44:44.830Z"),
+        member(runId, 1, "step1", "Étape 1", 0, "completed", "2026-09-17T14:44:44.830Z"),
+        member(runId, 2, "step2", "Étape 2", 1, "running", "2026-09-17T14:44:44.830Z"),
+        // No wf:3 row was ever persisted; the completion restates all phases.
+        completed(runId, ["Étape 1", "Étape 2", "Étape 3"], "2026-09-17T14:44:47.831Z"),
+      ]),
+    ).toEqual(["Étape 1:done", "Étape 2:done", "Étape 3:skipped"]);
+  });
+
+  it("run mu5ovdm1 (thread 2b4787a2): only step1 was ever reported", () => {
+    const runId = "test-3-etapes-mu5ovdm1-allc79";
+    expect(
+      phaseStates([
+        started(runId, ["Etape 1"], "2026-09-17T15:33:07.035Z"),
+        member(runId, 1, "Etape 1 agent 1", "Etape 1", 0, "running", "2026-09-17T15:33:07.035Z"),
+        completed(runId, ["Etape 1", "Etape 2", "Etape 3"], "2026-09-17T15:33:10.037Z"),
+      ]),
+    ).toEqual(["Etape 1:done", "Etape 2:skipped", "Etape 3:skipped"]);
   });
 });

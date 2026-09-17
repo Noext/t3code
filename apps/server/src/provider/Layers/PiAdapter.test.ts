@@ -32,6 +32,7 @@ import { ServerConfig } from "../../config.ts";
 import type { ProviderAdapterError } from "../Errors.ts";
 import { makePiAdapter, buildPiLaunchArgs, splitPiModelSlug } from "./PiAdapter.ts";
 import * as PiRpcTransport from "../pi/PiRpcTransport.ts";
+import { piWorkflowProjectKey } from "../pi/PiWorkflowStore.ts";
 
 const instanceId = ProviderInstanceId.make("pi-test");
 const decodePiSettings = Schema.decodeSync(PiSettings);
@@ -81,6 +82,7 @@ const turnStartEntryIds = (cursor: unknown): ReadonlyArray<unknown> => {
 const makeAdapterEffect = (
   settings: PiSettings = enabledSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  workflow: { readonly workflowStoreRoot?: string; readonly workflowSweepIntervalMs?: number } = {},
 ) =>
   Effect.gen(function* () {
     const executable = yield* HostProcessExecutablePath;
@@ -92,11 +94,19 @@ const makeAdapterEffect = (
     // The fixture persists its session tree here, so a test that resumes a
     // thread from a second adapter sees what the first process left behind.
     const sessionDir = path.join(serverConfig.baseDir, "pi-sessions");
+    // Hermetic by default: a test must never read the operator's real
+    // `~/.pi/workflows` store, and the fixture root keeps runs isolated.
+    const workflowStoreRoot =
+      workflow.workflowStoreRoot ?? path.join(serverConfig.baseDir, "workflow-home");
     const adapter = yield* makePiAdapter(settings, {
       instanceId,
       environment,
       sessionDir,
       childProcessSpawner,
+      workflowStoreRoot,
+      ...(workflow.workflowSweepIntervalMs !== undefined
+        ? { workflowSweepIntervalMs: workflow.workflowSweepIntervalMs }
+        : {}),
       makeTransport: ({ cwd, args, env }) => {
         launches.push(args);
         return PiRpcTransport.make({
@@ -107,12 +117,20 @@ const makeAdapterEffect = (
         });
       },
     });
-    return { adapter, launches, sessionDir };
+    return { adapter, launches, sessionDir, baseDir: serverConfig.baseDir };
   });
 
-const makeHarness = (settings?: PiSettings, environment: NodeJS.ProcessEnv = process.env) =>
+const makeHarness = (
+  settings?: PiSettings,
+  environment: NodeJS.ProcessEnv = process.env,
+  workflow: { readonly workflowStoreRoot?: string; readonly workflowSweepIntervalMs?: number } = {},
+) =>
   Effect.gen(function* () {
-    const { adapter, launches, sessionDir } = yield* makeAdapterEffect(settings, environment);
+    const { adapter, launches, sessionDir, baseDir } = yield* makeAdapterEffect(
+      settings,
+      environment,
+      workflow,
+    );
     const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
     yield* Stream.runForEach(adapter.streamEvents, (event) => Queue.offer(events, event)).pipe(
       Effect.forkScoped,
@@ -135,7 +153,9 @@ const makeHarness = (settings?: PiSettings, environment: NodeJS.ProcessEnv = pro
           skipped.push(event);
         }
       }).pipe(Effect.timeout("10 seconds"));
-    return { adapter, launches, sessionDir, events, waitFor };
+    /** Non-blocking drain: `Queue.takeAll` waits for one event, this does not. */
+    const drain = () => Queue.takeBetween(events, 0, Number.POSITIVE_INFINITY);
+    return { adapter, launches, sessionDir, baseDir, events, waitFor, drain };
   });
 
 const startInput = (
@@ -151,6 +171,72 @@ const startInput = (
 
 const test = <E>(name: string, body: () => Effect.Effect<void, E, TestEnv | Scope.Scope>) =>
   effectIt.live(name, () => Effect.provide(body(), layer));
+
+/** Pi session id the adapter launched this thread with (from its resume cursor). */
+const sessionIdOf = (cursor: unknown): string => {
+  if (typeof cursor === "object" && cursor !== null && "sessionId" in cursor) {
+    const id = (cursor as { sessionId?: unknown }).sessionId;
+    if (typeof id === "string") return id;
+  }
+  throw new Error("the session did not report a session id");
+};
+
+const workflowRunRecord = (
+  sessionId: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  runId: "run-1",
+  workflowName: "Adapter hardening",
+  status: "running",
+  phases: ["Recon", "Fix"],
+  currentPhase: "Recon",
+  agents: [
+    {
+      id: 1,
+      label: "recon-store",
+      phase: "Recon",
+      status: "running",
+      model: "local-openai/opencode-go/deepseek-v4.1-flash:high",
+      tokens: 1234,
+      startedAt: "2026-09-17T08:04:33.118Z",
+    },
+  ],
+  sessionId,
+  parentSessionId: sessionId,
+  startedAt: "2026-09-17T08:04:33.118Z",
+  updatedAt: "2026-09-17T08:05:33.118Z",
+  ...overrides,
+});
+
+/** Writes a run file where the extension would, for the thread's cwd key. */
+const writeWorkflowRunRaw = (storeRoot: string, runId: string, contents: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const runsDir = path.join(storeRoot, "projects", piWorkflowProjectKey(process.cwd()), "runs");
+    yield* fs.makeDirectory(runsDir, { recursive: true });
+    yield* fs.writeFileString(path.join(runsDir, `${runId}.json`), contents);
+  });
+
+const writeWorkflowRun = (storeRoot: string, runId: string, record: Record<string, unknown>) =>
+  writeWorkflowRunRaw(storeRoot, runId, JSON.stringify(record));
+
+const makeWorkflowHarness = (
+  options: { readonly store?: "valid" | "missing"; readonly intervalMs?: number } = {},
+) =>
+  Effect.gen(function* () {
+    const serverConfig = yield* ServerConfig;
+    const path = yield* Path.Path;
+    const workflowStoreRoot = path.join(
+      serverConfig.baseDir,
+      options.store === "missing" ? "no-such-workflow-home" : "workflow-home",
+    );
+    const harness = yield* makeHarness(undefined, process.env, {
+      workflowStoreRoot,
+      workflowSweepIntervalMs: options.intervalMs ?? 20,
+    });
+    return { ...harness, workflowStoreRoot };
+  });
 
 test("starts an RPC session and reports it", () =>
   Effect.scoped(
@@ -214,6 +300,286 @@ test("rejects a session when the provider is disabled", () =>
         .startSession(startInput(ThreadId.make("pi-thread-disabled")))
         .pipe(Effect.exit);
       expect(exit._tag).toBe("Failure");
+    }),
+  ));
+
+test("surfaces a workflow run attached to this thread's Pi session", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-workflow");
+      const session = yield* harness.adapter.startSession(startInput(threadId));
+      const sessionId = sessionIdOf(session.resumeCursor);
+      yield* Queue.takeAll(harness.events);
+
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-alpha",
+        workflowRunRecord(sessionId, { runId: "run-alpha" }),
+      );
+
+      const started = yield* harness.waitFor((event) => event.type === "task.started");
+      expect(started.type).toBe("task.started");
+      if (started.type === "task.started") {
+        expect(started.payload.taskId).toBe("run-alpha");
+        expect(started.payload.taskType).toBe("local_workflow");
+        expect(started.payload.workflowName).toBe("Adapter hardening");
+        expect(started.payload.runHandles).toEqual({ runId: "run-alpha" });
+      }
+
+      const progress = yield* harness.waitFor(
+        (event) => event.type === "task.progress" && event.payload.taskId === "run-alpha:wf:1",
+      );
+      expect(progress.type).toBe("task.progress");
+      if (progress.type === "task.progress") {
+        expect(progress.payload.status).toBe("running");
+        expect(progress.payload.parentAgentId).toBe("run-alpha");
+        expect(progress.payload.timelineBypass).toBe(true);
+      }
+
+      // A terminal write is one coordinator row and no member churn.
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-alpha",
+        workflowRunRecord(sessionId, {
+          runId: "run-alpha",
+          status: "completed",
+          currentPhase: "Fix",
+          completedAt: "2026-09-17T09:00:00.000Z",
+          durationMs: 1000,
+          agents: [{ id: 1, label: "recon-store", phase: "Recon", status: "done", tokens: 1234 }],
+        }),
+      );
+
+      const completed = yield* harness.waitFor(
+        (event) => event.type === "task.completed" && event.payload.taskId === "run-alpha",
+      );
+      expect(completed.type).toBe("task.completed");
+      if (completed.type === "task.completed") {
+        expect(completed.payload.status).toBe("completed");
+      }
+    }),
+  ));
+
+test("stays silent for a workflow run from another Pi session", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-workflow-foreign");
+      const session = yield* harness.adapter.startSession(startInput(threadId));
+      const sessionId = sessionIdOf(session.resumeCursor);
+      yield* Queue.takeAll(harness.events);
+
+      // Same directory, two runs: one belongs to this thread's session and one
+      // to another. The filter must drop exactly one of them — asserting silence
+      // alone would also pass if it dropped both.
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-foreign",
+        workflowRunRecord("another-pi-session", { runId: "run-foreign" }),
+      );
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-own",
+        workflowRunRecord(sessionId, { runId: "run-own" }),
+      );
+
+      yield* harness.waitFor(
+        (event) => event.type === "task.started" && event.payload.taskId === "run-own",
+      );
+      yield* Effect.sleep("100 millis");
+
+      const events = yield* harness.drain();
+      const taskIds = events
+        .filter((event) => event.type.startsWith("task."))
+        .map((event) => (event.payload as { taskId?: string }).taskId);
+      expect(taskIds).not.toContain("run-foreign");
+      expect(taskIds.every((taskId) => taskId === undefined || taskId.startsWith("run-own"))).toBe(
+        true,
+      );
+      // Silence, not a broken session: the thread still takes a turn.
+      yield* harness.adapter.sendTurn({ threadId, input: "hello" });
+    }),
+  ));
+
+test("survives a malformed workflow store file and a format change", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-workflow-malformed");
+      yield* harness.adapter.startSession(startInput(threadId));
+      yield* Queue.takeAll(harness.events);
+
+      yield* writeWorkflowRunRaw(harness.workflowStoreRoot, "run-broken", "{ not json");
+      // A future extension version renames the lifecycle field.
+      yield* writeWorkflowRun(harness.workflowStoreRoot, "run-renamed", {
+        runId: "run-renamed",
+        workflowName: "Future",
+        lifecycle: "running",
+      });
+      yield* Effect.sleep("200 millis");
+
+      const events = yield* harness.drain();
+      expect(events.filter((event) => event.type.startsWith("task."))).toEqual([]);
+      yield* harness.adapter.sendTurn({ threadId, input: "hello" });
+    }),
+  ));
+
+test("ignores an absent workflow store", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness({ store: "missing" });
+      const threadId = ThreadId.make("pi-thread-workflow-absent");
+      yield* harness.adapter.startSession(startInput(threadId));
+      yield* harness.drain();
+      yield* Effect.sleep("200 millis");
+
+      const events = yield* harness.drain();
+      expect(events.filter((event) => event.type.startsWith("task."))).toEqual([]);
+      yield* harness.adapter.sendTurn({ threadId, input: "hello" });
+    }),
+  ));
+
+test("keeps a surfaced workflow when its run file stops decoding, then completes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-workflow-corrupt");
+      const session = yield* harness.adapter.startSession(startInput(threadId));
+      const sessionId = sessionIdOf(session.resumeCursor);
+      yield* Queue.takeAll(harness.events);
+
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-corrupt",
+        workflowRunRecord(sessionId, { runId: "run-corrupt" }),
+      );
+      yield* harness.waitFor(
+        (event) => event.type === "task.started" && event.payload.taskId === "run-corrupt",
+      );
+
+      // A writer-side field rename lands on a run the tracker already holds.
+      // The file is still there and the run is still live, so the sweep must
+      // neither emit a terminal state nor drop the run.
+      yield* writeWorkflowRun(harness.workflowStoreRoot, "run-corrupt", {
+        runId: "run-corrupt",
+        workflowName: "Renamed",
+        lifecycle: "running",
+      });
+      yield* Effect.sleep("200 millis");
+      const during = yield* harness.drain();
+      expect(during.filter((event) => event.type.startsWith("task."))).toEqual([]);
+
+      // Readable again: the completion that landed while it was unreadable
+      // still reaches the thread.
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-corrupt",
+        workflowRunRecord(sessionId, {
+          runId: "run-corrupt",
+          status: "completed",
+          completedAt: "2026-09-17T09:00:00.000Z",
+          durationMs: 1000,
+        }),
+      );
+      const completed = yield* harness.waitFor(
+        (event) => event.type === "task.completed" && event.payload.taskId === "run-corrupt",
+      );
+      expect(completed.type).toBe("task.completed");
+    }),
+  ));
+
+test("keeps a surfaced workflow alive when the store cannot be listed at all", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-workflow-unlistable");
+      const session = yield* harness.adapter.startSession(startInput(threadId));
+      const sessionId = sessionIdOf(session.resumeCursor);
+      yield* Queue.takeAll(harness.events);
+
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-unlistable",
+        workflowRunRecord(sessionId, { runId: "run-unlistable" }),
+      );
+      yield* harness.waitFor(
+        (event) => event.type === "task.started" && event.payload.taskId === "run-unlistable",
+      );
+
+      // The run directory becomes unlistable. A failed sweep is not evidence
+      // that the run ended, so liveness must survive it.
+      const runsDir = path.join(
+        harness.workflowStoreRoot,
+        "projects",
+        piWorkflowProjectKey(process.cwd()),
+        "runs",
+      );
+      yield* fs.remove(runsDir, { recursive: true });
+      yield* fs.writeFileString(runsDir, "not a directory");
+      yield* Effect.sleep("150 millis");
+      const during = yield* harness.drain();
+      expect(during.filter((event) => event.type.startsWith("task."))).toEqual([]);
+
+      // And the sweep recovers: the readable terminal record still lands.
+      yield* fs.remove(runsDir);
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-unlistable",
+        workflowRunRecord(sessionId, {
+          runId: "run-unlistable",
+          status: "completed",
+          completedAt: "2026-09-17T09:00:00.000Z",
+          durationMs: 1000,
+        }),
+      );
+      const completed = yield* harness.waitFor(
+        (event) => event.type === "task.completed" && event.payload.taskId === "run-unlistable",
+      );
+      expect(completed.type).toBe("task.completed");
+    }),
+  ));
+
+test("clears a surfaced workflow when the store really drops the run", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-workflow-pruned");
+      const session = yield* harness.adapter.startSession(startInput(threadId));
+      const sessionId = sessionIdOf(session.resumeCursor);
+      yield* Queue.takeAll(harness.events);
+
+      yield* writeWorkflowRun(
+        harness.workflowStoreRoot,
+        "run-pruned",
+        workflowRunRecord(sessionId, { runId: "run-pruned" }),
+      );
+      yield* harness.waitFor(
+        (event) => event.type === "task.started" && event.payload.taskId === "run-pruned",
+      );
+
+      // The run file is gone from the store entirely: the liveness must clear
+      // rather than pulse forever. (Removed by the writer's retention, or by
+      // `workflow_control`, not merely unreadable — that case stays silent.)
+      const runsDir = path.join(
+        harness.workflowStoreRoot,
+        "projects",
+        piWorkflowProjectKey(process.cwd()),
+        "runs",
+      );
+      yield* fs.remove(path.join(runsDir, "run-pruned.json"));
+
+      const interrupted = yield* harness.waitFor(
+        (event) =>
+          event.type === "task.updated" &&
+          event.payload.taskId === "run-pruned" &&
+          event.payload.status === "interrupted",
+      );
+      expect(interrupted.type).toBe("task.updated");
     }),
   ));
 
