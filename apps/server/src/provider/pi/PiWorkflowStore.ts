@@ -221,12 +221,17 @@ export function piWorkflowProjectKey(cwd: string): string {
   return `${slug}-${hash}`;
 }
 
-const finiteNonNegative = (value: number | null | undefined): number | undefined => {
+/**
+ * The two bounds a foreign record's fields go through on their way into a
+ * snapshot: shared with the `pi-workflows-claude` feed reader, which reads a
+ * different file format into the same snapshot.
+ */
+export const finiteNonNegative = (value: number | null | undefined): number | undefined => {
   if (value === undefined || value === null || !Number.isFinite(value)) return undefined;
   return Math.max(0, Math.trunc(value));
 };
 
-const boundText = (value: string | null | undefined): string | undefined => {
+export const boundText = (value: string | null | undefined): string | undefined => {
   const trimmed = value?.trim();
   if (!trimmed || trimmed.length === 0) return undefined;
   return trimmed.length > MAX_TEXT_LENGTH ? trimmed.slice(0, MAX_TEXT_LENGTH) : trimmed;

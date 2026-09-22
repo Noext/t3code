@@ -89,6 +89,7 @@ import {
 } from "../pi/PiWorkflowProgress.ts";
 import * as PiRpcTransport from "../pi/PiRpcTransport.ts";
 import type { PiRpcEvent, PiRpcTransportShape } from "../pi/PiRpcTransport.ts";
+import { makePiClaudeWorkflowStore } from "../pi/PiClaudeWorkflowStore.ts";
 import { defaultPiWorkflowStoreRoot, makePiWorkflowStore } from "../pi/PiWorkflowStore.ts";
 import {
   piDeltaStreamKind,
@@ -455,17 +456,22 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     }).pipe(Effect.flatMap((lock) => lock.withPermit(task)));
 
   //
-  // Pi workflow runs (dynamic workflows, `@quintinshaw/pi-dynamic-workflows`).
+  // Pi workflow runs, from the two extensions that can write them: the
+  // `@quintinshaw/pi-dynamic-workflows` run store, and the
+  // `pi-workflows-claude` feed in this provider instance's Pi session directory.
   //
-  // The extension draws its live progress in a TUI panel that RPC mode cannot
-  // serve, so the only live source is the run store it writes to disk. This
-  // reader is off the turn path by construction: it is a spaced sweep forked
-  // into the thread's session scope, it never blocks a turn, and every failure
-  // is swallowed and logged so a foreign, unversioned format can only make the
-  // feature invisible, never break a thread.
+  // Both extensions draw their live progress in a TUI panel that RPC mode cannot
+  // serve, so the only live source is what they write to disk. This reader is off
+  // the turn path by construction: it is a spaced sweep forked into the thread's
+  // session scope, it never blocks a turn, and every failure is swallowed and
+  // logged so a foreign, unversioned format can only make the feature invisible,
+  // never break a thread.
   //
   const workflowStore = yield* makePiWorkflowStore({
     homeDir: options.workflowStoreRoot ?? defaultPiWorkflowStoreRoot(options.environment),
+  });
+  const claudeWorkflowStore = yield* makePiClaudeWorkflowStore({
+    sessionDir: options.sessionDir,
   });
   // A non-positive or non-finite cadence would be a hot loop over the store.
   const configuredSweepIntervalMs = options.workflowSweepIntervalMs ?? 3_000;
@@ -509,13 +515,22 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     Effect.gen(function* () {
       let tracker = emptyPiWorkflowTracker();
       const sweep = Effect.gen(function* () {
-        const listing = yield* workflowStore.listRunsForSession({
-          cwd: context.cwd,
-          sessionIds: [context.sessionId],
-        });
+        // Both stores are read before anything is concluded: a store that cannot
+        // be read at all leaves the whole round inconclusive (the guard below
+        // keeps the tracker), rather than reporting its runs as ended.
+        const [snapshotListing, feedListing] = yield* Effect.all(
+          [
+            workflowStore.listRunsForSession({
+              cwd: context.cwd,
+              sessionIds: [context.sessionId],
+            }),
+            claudeWorkflowStore.listRunsForSession({ sessionIds: [context.sessionId] }),
+          ],
+          { concurrency: 2 },
+        );
         const reconciled = reconcilePiWorkflowRuns({
-          runs: listing.runs,
-          unresolvedRunIds: listing.unresolvedRunIds,
+          runs: [...snapshotListing.runs, ...feedListing.runs],
+          unresolvedRunIds: [...snapshotListing.unresolvedRunIds, ...feedListing.unresolvedRunIds],
           tracker,
         });
         tracker = reconciled.tracker;

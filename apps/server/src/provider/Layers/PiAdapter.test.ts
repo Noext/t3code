@@ -221,6 +221,51 @@ const writeWorkflowRunRaw = (storeRoot: string, runId: string, contents: string)
 const writeWorkflowRun = (storeRoot: string, runId: string, record: Record<string, unknown>) =>
   writeWorkflowRunRaw(storeRoot, runId, JSON.stringify(record));
 
+/**
+ * Writes a feed where `pi-workflows-claude` would: under the Pi session directory
+ * this adapter launched the fixture with, which is the whole point of that
+ * extension's layout — the directory is T3's, not the operator's `~/.pi`.
+ */
+const writeClaudeFeed = (sessionDir: string, runId: string, contents: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const workflowsDir = path.join(sessionDir, "workflows");
+    yield* fs.makeDirectory(workflowsDir, { recursive: true });
+    yield* fs.writeFileString(path.join(workflowsDir, `${runId}.events.jsonl`), contents);
+  });
+
+const appendClaudeFeed = (sessionDir: string, runId: string, contents: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    yield* fs.writeFileString(
+      path.join(sessionDir, "workflows", `${runId}.events.jsonl`),
+      contents,
+      {
+        flag: "a",
+      },
+    );
+  });
+
+/** One feed line, stamped the way the writer stamps it. */
+const feedLine = (value: Record<string, unknown>, t = 1_000) =>
+  `${JSON.stringify({ t, ...value })}\n`;
+
+const claudeFeedRun = (sessionId: string, runId: string, overrides: Record<string, unknown> = {}) =>
+  feedLine({
+    type: "run",
+    runId,
+    sessionId,
+    workflowName: "Adapter hardening",
+    startTime: 1_000,
+    phases: [
+      { index: 1, title: "Recon" },
+      { index: 2, title: "Fix" },
+    ],
+    ...overrides,
+  });
+
 const makeWorkflowHarness = (
   options: { readonly store?: "valid" | "missing"; readonly intervalMs?: number } = {},
 ) =>
@@ -399,6 +444,100 @@ test("stays silent for a workflow run from another Pi session", () =>
       );
       // Silence, not a broken session: the thread still takes a turn.
       yield* harness.adapter.sendTurn({ threadId, input: "hello" });
+    }),
+  ));
+
+test("surfaces a pi-workflows-claude run from the thread's session feed", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-claude-workflow");
+      const session = yield* harness.adapter.startSession(startInput(threadId));
+      const sessionId = sessionIdOf(session.resumeCursor);
+      yield* Queue.takeAll(harness.events);
+
+      yield* writeClaudeFeed(
+        harness.sessionDir,
+        "wf_a1b2c3d4-e5f",
+        [
+          claudeFeedRun(sessionId, "wf_a1b2c3d4-e5f"),
+          feedLine(
+            {
+              type: "workflow_agent",
+              index: 1,
+              label: "recon-store",
+              phaseTitle: "Recon",
+              state: "start",
+              lastProgressAt: 1_200,
+            },
+            1_200,
+          ),
+        ].join(""),
+      );
+
+      const started = yield* harness.waitFor((event) => event.type === "task.started");
+      if (started.type !== "task.started") throw new Error("expected task.started");
+      expect(started.payload.taskId).toBe("wf_a1b2c3d4-e5f");
+      expect(started.payload.taskType).toBe("local_workflow");
+      expect(started.payload.workflowName).toBe("Adapter hardening");
+      expect(started.payload.phases).toEqual([
+        { index: 0, title: "Recon" },
+        { index: 1, title: "Fix" },
+      ]);
+
+      const progress = yield* harness.waitFor(
+        (event) =>
+          event.type === "task.progress" && event.payload.taskId === "wf_a1b2c3d4-e5f:wf:1",
+      );
+      if (progress.type !== "task.progress") throw new Error("expected a member row");
+      expect(progress.payload.status).toBe("running");
+      expect(progress.payload.parentAgentId).toBe("wf_a1b2c3d4-e5f");
+
+      // The feed's terminal record is what settles the card.
+      yield* appendClaudeFeed(
+        harness.sessionDir,
+        "wf_a1b2c3d4-e5f",
+        feedLine({ type: "status", status: "completed", endTime: 2_000, totalTokens: 120 }, 2_000),
+      );
+
+      const completed = yield* harness.waitFor(
+        (event) => event.type === "task.completed" && event.payload.taskId === "wf_a1b2c3d4-e5f",
+      );
+      if (completed.type !== "task.completed") throw new Error("expected task.completed");
+      expect(completed.payload.status).toBe("completed");
+    }),
+  ));
+
+test("stays silent for a feed run owned by another Pi session", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness();
+      const threadId = ThreadId.make("pi-thread-claude-workflow-foreign");
+      const session = yield* harness.adapter.startSession(startInput(threadId));
+      const sessionId = sessionIdOf(session.resumeCursor);
+      yield* Queue.takeAll(harness.events);
+
+      // One session directory, two threads' runs: the feed directory alone cannot
+      // tell them apart, so only the run record's owner can.
+      yield* writeClaudeFeed(
+        harness.sessionDir,
+        "wf_foreign",
+        claudeFeedRun("another-pi-session", "wf_foreign"),
+      );
+      yield* writeClaudeFeed(harness.sessionDir, "wf_own", claudeFeedRun(sessionId, "wf_own"));
+
+      yield* harness.waitFor(
+        (event) => event.type === "task.started" && event.payload.taskId === "wf_own",
+      );
+      yield* Effect.sleep("100 millis");
+
+      const taskIds = (yield* harness.drain())
+        .filter((event) => event.type.startsWith("task."))
+        .map((event) => (event.payload as { taskId?: string }).taskId);
+      expect(taskIds).not.toContain("wf_foreign");
+      expect(taskIds.every((taskId) => taskId === undefined || taskId.startsWith("wf_own"))).toBe(
+        true,
+      );
     }),
   ));
 
