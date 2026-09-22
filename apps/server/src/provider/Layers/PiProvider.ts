@@ -59,6 +59,10 @@ import {
   type PiCatalogModel,
 } from "../pi/piModelCatalog.ts";
 import { probePiCommands, type PiCommandsTransportFactory } from "../Drivers/PiCommands.ts";
+import {
+  probePiThinkingLevels,
+  type PiThinkingLevelsTransportFactory,
+} from "../Drivers/PiThinkingLevels.ts";
 import { discoverPiSkills } from "../Drivers/PiSkills.ts";
 
 const PI_PRESENTATION = {
@@ -179,6 +183,11 @@ export interface PiProviderProbeOptions {
    * `get_commands` probe; production spawns `pi --mode rpc`.
    */
   readonly makeCommandsTransport?: PiCommandsTransportFactory | undefined;
+  /**
+   * Same, for the `get_available_thinking_levels` probe that fills each model's
+   * Reasoning selector.
+   */
+  readonly makeThinkingLevelsTransport?: PiThinkingLevelsTransportFactory | undefined;
 }
 
 export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function* (
@@ -301,11 +310,6 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
   }
 
   const providers = distinctProviders(catalogModels);
-  const discoveredModels = piCatalogToServerProviderModels(catalogModels);
-  const models =
-    discoveredModels.length > 0
-      ? piModelsFromSettings(piSettings.customModels, discoveredModels)
-      : fallbackModels;
 
   // Skill discovery is best-effort: an unreadable skills root must not turn a
   // working provider into an error card.
@@ -313,11 +317,30 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
     Effect.tapError((cause) => Effect.logDebug("Pi skill discovery failed.", { cause })),
     Effect.orElseSucceed(() => []),
   );
-  const commandsProbe = yield* probePiCommands(piSettings, {
-    ...(cwd === undefined ? {} : { cwd }),
-    environment,
-    ...(options.makeCommandsTransport ? { makeTransport: options.makeCommandsTransport } : {}),
-  }).pipe(Effect.result);
+  // Two `pi --mode rpc` probes, run together because each one pays Pi's
+  // extension startup on its own: slash commands feed the `/` menu, thinking
+  // levels feed the Reasoning selector. Neither can fail the snapshot.
+  const thinkingModels = catalogModels.filter((model) => model.supportsThinking);
+  const [commandsProbe, thinkingLevelsProbe] = yield* Effect.all(
+    [
+      probePiCommands(piSettings, {
+        ...(cwd === undefined ? {} : { cwd }),
+        environment,
+        ...(options.makeCommandsTransport ? { makeTransport: options.makeCommandsTransport } : {}),
+      }).pipe(Effect.result),
+      thinkingModels.length === 0
+        ? Effect.succeed(Result.succeed(new Map<string, ReadonlyArray<string>>()))
+        : probePiThinkingLevels(piSettings, {
+            models: thinkingModels,
+            ...(cwd === undefined ? {} : { cwd }),
+            environment,
+            ...(options.makeThinkingLevelsTransport
+              ? { makeTransport: options.makeThinkingLevelsTransport }
+              : {}),
+          }).pipe(Effect.result),
+    ],
+    { concurrency: 2 },
+  );
   const discoveredCommands = Result.isSuccess(commandsProbe) ? commandsProbe.success : undefined;
   if (discoveredCommands === undefined) {
     // A timeout or transport failure says nothing about what commands exist,
@@ -327,6 +350,22 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
       stage: Result.isFailure(commandsProbe) ? commandsProbe.failure.stage : "unknown",
     });
   }
+  if (Result.isFailure(thinkingLevelsProbe)) {
+    // Levels only widen the Reasoning selector, so a failed probe leaves every
+    // model on the portable set rather than degrading the provider snapshot.
+    yield* Effect.logWarning("Pi thinking level listing failed or timed out.", {
+      stage: thinkingLevelsProbe.failure.stage,
+      modelCount: thinkingModels.length,
+    });
+  }
+  const discoveredModels = piCatalogToServerProviderModels(
+    catalogModels,
+    Result.isSuccess(thinkingLevelsProbe) ? thinkingLevelsProbe.success : undefined,
+  );
+  const models =
+    discoveredModels.length > 0
+      ? piModelsFromSettings(piSettings.customModels, discoveredModels)
+      : fallbackModels;
   const slashCommands = piSlashCommands(discoveredCommands);
 
   if (catalogProbeFailed) {

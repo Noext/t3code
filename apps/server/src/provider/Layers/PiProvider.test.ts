@@ -1,6 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { PiSettings } from "@t3tools/contracts";
+import { PiSettings, type ServerProviderModel } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -11,8 +11,13 @@ import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as PiRpcTransport from "../pi/PiRpcTransport.ts";
+import type { PiThinkingLevelsTransportFactory } from "../Drivers/PiThinkingLevels.ts";
 import { COMPACT_SLASH_COMMAND } from "../providerSnapshot.ts";
-import { checkPiProviderStatus, piSlashCommands } from "./PiProvider.ts";
+import {
+  checkPiProviderStatus,
+  piSlashCommands,
+  type PiProviderProbeOptions,
+} from "./PiProvider.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
 const enabledSettings = decodePiSettings({ enabled: true });
@@ -20,10 +25,15 @@ const enabledSettings = decodePiSettings({ enabled: true });
 const encoder = new TextEncoder();
 
 const MODEL_CATALOG = [
-  "provider      model     context  max-out  thinking  images",
-  "local-openai  kimi-k3   128K     8.2K     yes       no",
+  "provider      model                                     context  max-out  thinking  images",
+  "local-openai  kimi-k3                                   128K     8.2K     yes       no",
+  "local-openai  opencode-go/deepseek-v4.1-flash           1M       131.1K   yes       yes",
   "",
 ].join("\n");
+
+/** What a real Pi reports for this model: the portable levels plus two more. */
+const DEEPSEEK_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const PORTABLE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"];
 
 /**
  * Stands in for the `pi` binary for the `--version` and `--list-models`
@@ -70,6 +80,53 @@ const scriptedCommandsTransport = (
   kill: Effect.void,
 });
 
+/**
+ * Scripted `get_available_thinking_levels`: answers for the models in the map
+ * and refuses the rest, which is how a catalog where only some models reach
+ * `xhigh`/`max` reaches the composer.
+ */
+const scriptedThinkingLevelsTransport =
+  (levelsByModelId: ReadonlyMap<string, ReadonlyArray<string>>): PiThinkingLevelsTransportFactory =>
+  () => {
+    let currentModelId: string | undefined;
+    return Effect.succeed({
+      ...scriptedCommandsTransport(() => Effect.die("unused")),
+      request: (command) => {
+        if (command.type === "set_model") {
+          currentModelId = String(command.modelId);
+          return Effect.succeed({ id: currentModelId });
+        }
+        const levels =
+          command.type === "get_available_thinking_levels" && currentModelId !== undefined
+            ? levelsByModelId.get(currentModelId)
+            : undefined;
+        return levels
+          ? Effect.succeed({ levels })
+          : Effect.fail(
+              new PiRpcTransport.PiRpcCommandError({
+                commandType: String(command.type),
+                detail: `no thinking levels for ${currentModelId ?? "no model"}`,
+              }),
+            );
+      },
+    });
+  };
+
+/** The level ids the composer would render for a model in the snapshot. */
+const reasoningLevelIds = (model: Pick<ServerProviderModel, "capabilities"> | undefined) => {
+  const descriptor = model?.capabilities?.optionDescriptors?.[0];
+  return descriptor?.type === "select" ? descriptor.options.map((option) => option.id) : undefined;
+};
+
+/**
+ * A thinking-levels probe scripting "Pi answered nothing for any model", which
+ * leaves every model on the portable levels. Tests that care about the levels
+ * pass their own `makeThinkingLevelsTransport` instead.
+ */
+const portableLevelProbe: PiProviderProbeOptions = {
+  makeThinkingLevelsTransport: scriptedThinkingLevelsTransport(new Map()),
+};
+
 const writeSkill = (filePath: string, description: string) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -104,6 +161,7 @@ it.layer(NodeServices.layer)("checkPiProviderStatus", (it) => {
         { ...process.env, HOME: home },
         workspace,
         {
+          ...portableLevelProbe,
           makeCommandsTransport: () =>
             Effect.succeed(
               scriptedCommandsTransport(() =>
@@ -166,6 +224,7 @@ it.layer(NodeServices.layer)("checkPiProviderStatus", (it) => {
         { ...process.env, HOME: home },
         workspace,
         {
+          ...portableLevelProbe,
           makeCommandsTransport: () =>
             Effect.succeed(
               scriptedCommandsTransport(() =>
@@ -205,6 +264,7 @@ it.layer(NodeServices.layer)("checkPiProviderStatus", (it) => {
         { ...process.env, HOME: path.join(tempDir, "home") },
         path.join(tempDir, "workspace"),
         {
+          ...portableLevelProbe,
           makeCommandsTransport: () =>
             Effect.succeed(scriptedCommandsTransport(() => Effect.succeed({ commands: [] }))),
         },
@@ -213,6 +273,67 @@ it.layer(NodeServices.layer)("checkPiProviderStatus", (it) => {
       assert.strictEqual(snapshot.status, "ready");
       assert.deepStrictEqual(snapshot.slashCommands, [COMPACT_SLASH_COMMAND]);
     }),
+  );
+  it.effect("gives each model the reasoning levels Pi reports for it", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-provider-" });
+
+      const snapshot = yield* checkPiProviderStatus(
+        enabledSettings,
+        { ...process.env, HOME: path.join(tempDir, "home") },
+        path.join(tempDir, "workspace"),
+        {
+          makeCommandsTransport: () =>
+            Effect.succeed(scriptedCommandsTransport(() => Effect.succeed({ commands: [] }))),
+          makeThinkingLevelsTransport: scriptedThinkingLevelsTransport(
+            new Map([["opencode-go/deepseek-v4.1-flash", DEEPSEEK_THINKING_LEVELS]]),
+          ),
+        },
+      ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, mockPiCliSpawner()));
+
+      const levelsFor = (slug: string) =>
+        reasoningLevelIds(snapshot.models.find((model) => model.slug === slug));
+
+      assert.deepStrictEqual(
+        levelsFor("local-openai/opencode-go/deepseek-v4.1-flash"),
+        DEEPSEEK_THINKING_LEVELS,
+      );
+      // `kimi-k3` is not in the probe's answer, so it keeps the portable set.
+      assert.deepStrictEqual(levelsFor("local-openai/kimi-k3"), PORTABLE_THINKING_LEVELS);
+      assert.strictEqual(snapshot.status, "ready");
+    }),
+  );
+
+  it.effect(
+    "keeps the portable levels and a ready snapshot when the level probe cannot start",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-provider-" });
+
+        const snapshot = yield* checkPiProviderStatus(
+          enabledSettings,
+          { ...process.env, HOME: path.join(tempDir, "home") },
+          path.join(tempDir, "workspace"),
+          {
+            makeCommandsTransport: () =>
+              Effect.succeed(scriptedCommandsTransport(() => Effect.succeed({ commands: [] }))),
+            makeThinkingLevelsTransport: () =>
+              Effect.fail(
+                new PiRpcTransport.PiRpcSpawnError({ command: "pi", cause: new Error("spawn") }),
+              ),
+          },
+        ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, mockPiCliSpawner()));
+
+        // A missing reasoning level narrows the composer and nothing else.
+        assert.strictEqual(snapshot.status, "ready");
+        for (const model of snapshot.models) {
+          assert.deepStrictEqual(reasoningLevelIds(model), PORTABLE_THINKING_LEVELS);
+        }
+      }),
   );
 });
 

@@ -1,3 +1,4 @@
+import type { ServerProviderModel } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -120,6 +121,29 @@ describe("parsePiCompactTokenCount", () => {
 });
 
 describe("piCatalogToServerProviderModels", () => {
+  /** The level ids the composer would render for a model. */
+  const reasoningLevelIds = (model: ServerProviderModel | undefined) => {
+    const descriptor = model?.capabilities?.optionDescriptors?.[0];
+    return descriptor?.type === "select"
+      ? descriptor.options.map((option) => option.id)
+      : undefined;
+  };
+
+  const defaultReasoningLevel = (model: ServerProviderModel | undefined) => {
+    const descriptor = model?.capabilities?.optionDescriptors?.[0];
+    return descriptor?.type === "select"
+      ? descriptor.options.filter((option) => option.isDefault).map((option) => option.id)
+      : undefined;
+  };
+
+  const catalogModel = (model: string, supportsThinking = true) => ({
+    provider: "local-openai",
+    model,
+    supportsThinking,
+    contextWindow: 131_072,
+    maxOutputTokens: 8_192,
+  });
+
   it("namespaces slugs by provider and exposes thinking as a reasoning option", () => {
     const [thinking, plain] = piCatalogToServerProviderModels([
       {
@@ -149,5 +173,36 @@ describe("piCatalogToServerProviderModels", () => {
       type: "select",
     });
     expect(plain?.capabilities?.optionDescriptors).toEqual([]);
+  });
+
+  it("offers the levels the probe reported instead of the portable set", () => {
+    const deepseek = "opencode-go/deepseek-v4.1-flash";
+    const [reported, unreported] = piCatalogToServerProviderModels(
+      [catalogModel(deepseek), catalogModel("opencode-go/glm-5.2")],
+      new Map([["local-openai/opencode-go/deepseek-v4.1-flash", ["off", "low", "xhigh", "max"]]]),
+    );
+
+    expect(reasoningLevelIds(reported)).toEqual(["off", "low", "xhigh", "max"]);
+    // These levels offer neither `medium` nor `high`, so T3 marks no default
+    // rather than claiming one Pi never agreed to.
+    expect(defaultReasoningLevel(reported)).toEqual([]);
+    // A model the probe had no answer for keeps the levels T3 can always send.
+    expect(reasoningLevelIds(unreported)).toEqual(["off", "minimal", "low", "medium", "high"]);
+    expect(defaultReasoningLevel(unreported)).toEqual(["medium"]);
+  });
+
+  it("keeps medium as the default when the reported levels include it", () => {
+    const [model] = piCatalogToServerProviderModels(
+      [catalogModel("opencode-go/deepseek-v4.1-flash")],
+      new Map([
+        [
+          "local-openai/opencode-go/deepseek-v4.1-flash",
+          ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        ],
+      ]),
+    );
+
+    expect(reasoningLevelIds(model)).toHaveLength(7);
+    expect(defaultReasoningLevel(model)).toEqual(["medium"]);
   });
 });
