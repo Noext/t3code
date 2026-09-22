@@ -564,11 +564,19 @@ const handle = (command) => {
     case "set_thinking_level":
       respond(id, "set_thinking_level", { level: command.level });
       return;
-    case "get_available_thinking_levels":
+    case "get_available_thinking_levels": {
+      // Pi answers for the model the session holds, and that answer differs per
+      // model: some catalogs reach `xhigh`/`max`, most stop at `high`.
+      // `FAKE_PI_THINKING_LEVELS` is either one array for every model or an
+      // object keyed by model id.
+      const configured = JSON.parse(
+        process.env.FAKE_PI_THINKING_LEVELS ?? '["off","minimal","low","medium","high"]',
+      );
       respond(id, "get_available_thinking_levels", {
-        levels: ["off", "minimal", "low", "medium", "high"],
+        levels: Array.isArray(configured) ? configured : (configured[currentModel.id] ?? []),
       });
       return;
+    }
     case "prompt":
       if (settling && command.streamingBehavior !== "steer") {
         write({

@@ -6,12 +6,16 @@
  * events, and process exit. Every behavior is driven by the command it receives
  * so a single script covers correlation, ordering, timeouts, and shutdown.
  * `get_commands` is scripted through `FAKE_PI_COMMANDS` /
- * `FAKE_PI_GET_COMMANDS` so provider probes can be driven without a model.
+ * `FAKE_PI_GET_COMMANDS` so provider probes can be driven without a model, and
+ * `set_model` / `get_available_thinking_levels` through `FAKE_PI_REJECT_MODEL`,
+ * `FAKE_PI_THINKING_LEVELS` and `FAKE_PI_GET_LEVELS` for the same reason.
  *
  * Run as: node fakePiRpc.mjs
  */
 
 let buffer = "";
+/** What `set_model` last accepted, so level answers can differ per model. */
+let currentModelId = "";
 
 const write = (value) => {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -64,6 +68,49 @@ const handle = (command) => {
         return;
       }
       respond(id, "get_commands", JSON.parse(process.env.FAKE_PI_COMMANDS ?? '{"commands":[]}'));
+      return;
+    }
+    case "set_model": {
+      const rejected = (process.env.FAKE_PI_REJECT_MODEL ?? "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      if (rejected.includes(command.modelId)) {
+        write({
+          type: "response",
+          id,
+          command: "set_model",
+          success: false,
+          error: `unknown model: ${command.modelId}`,
+        });
+        return;
+      }
+      currentModelId = command.modelId;
+      respond(id, "set_model", { id: command.modelId, provider: command.provider });
+      return;
+    }
+    case "get_available_thinking_levels": {
+      // `FAKE_PI_THINKING_LEVELS` is either one array for every model or an
+      // object keyed by model id, which is how a test reproduces a catalog
+      // where only some models reach `xhigh`/`max`.
+      const mode = process.env.FAKE_PI_GET_LEVELS ?? "ok";
+      if (mode === "silent") return;
+      if (mode === "error") {
+        write({
+          type: "response",
+          id,
+          command: "get_available_thinking_levels",
+          success: false,
+          error: "thinking levels unavailable",
+        });
+        return;
+      }
+      const configured = JSON.parse(
+        process.env.FAKE_PI_THINKING_LEVELS ?? '["off","minimal","low","medium","high"]',
+      );
+      respond(id, "get_available_thinking_levels", {
+        levels: Array.isArray(configured) ? configured : (configured[currentModelId] ?? []),
+      });
       return;
     }
     case "emit":

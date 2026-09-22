@@ -60,8 +60,10 @@ export function parsePiCompactTokenCount(value: string): number | undefined {
 
 /**
  * Think levels Pi accepts for a model that advertises reasoning at all. `xhigh`
- * and `max` are model-specific and are resolved per session through
- * `get_available_thinking_levels`, so they are deliberately absent here.
+ * and `max` are model-specific and only Pi can resolve them, per model, through
+ * `get_available_thinking_levels`. This set is what a model falls back to when
+ * the thinking-levels probe has no answer for it — the `--list-models` table
+ * above says a model reasons but never says at which levels.
  */
 const PORTABLE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
 
@@ -126,20 +128,35 @@ export function parsePiModelCatalog(output: string): ReadonlyArray<PiCatalogMode
 
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({ optionDescriptors: [] });
 
-function piModelCapabilities(supportsThinking: boolean): ModelCapabilities {
+/**
+ * Which level the composer starts on. This probe does not report a per-model
+ * default, and `medium` is what every catalog model on this machine accepts, so
+ * it stays the default; a model that omits it falls back to `high`, and one
+ * that offers neither is left without a default rather than given a level Pi
+ * never agreed to.
+ */
+const preferredThinkingLevel = (levels: ReadonlyArray<string>): string | undefined =>
+  levels.includes("medium") ? "medium" : levels.includes("high") ? "high" : undefined;
+
+function piModelCapabilities(
+  supportsThinking: boolean,
+  levels?: ReadonlyArray<string> | undefined,
+): ModelCapabilities {
   if (!supportsThinking) {
     return EMPTY_CAPABILITIES;
   }
+  const available = levels && levels.length > 0 ? levels : PORTABLE_THINKING_LEVELS;
+  const defaultLevel = preferredThinkingLevel(available);
   return createModelCapabilities({
     optionDescriptors: [
       {
         id: "reasoningEffort",
         label: "Reasoning",
         type: "select",
-        options: PORTABLE_THINKING_LEVELS.map((level) => ({
+        options: available.map((level) => ({
           id: level,
           label: level,
-          ...(level === "medium" ? { isDefault: true } : {}),
+          ...(level === defaultLevel ? { isDefault: true } : {}),
         })),
       },
     ],
@@ -157,6 +174,12 @@ export function piModelSlug(model: PiCatalogModel): string {
 
 export function piCatalogToServerProviderModels(
   models: ReadonlyArray<PiCatalogModel>,
+  /**
+   * Reasoning levels keyed by the slug {@link piModelSlug} produces, as the
+   * thinking-levels probe reports them. A missing entry means "ask Pi again" is
+   * the only way to know, so that model keeps the portable set.
+   */
+  thinkingLevels?: ReadonlyMap<string, ReadonlyArray<string>> | undefined,
 ): ReadonlyArray<ServerProviderModel> {
   const seen = new Set<string>();
   const providerModels: Array<ServerProviderModel> = [];
@@ -171,7 +194,7 @@ export function piCatalogToServerProviderModels(
       name: model.model,
       subProvider: model.provider,
       isCustom: false,
-      capabilities: piModelCapabilities(model.supportsThinking),
+      capabilities: piModelCapabilities(model.supportsThinking, thinkingLevels?.get(slug)),
     });
   }
   return providerModels;
