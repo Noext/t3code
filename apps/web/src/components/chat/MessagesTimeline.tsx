@@ -244,6 +244,7 @@ import { createContextPresentationRegistry } from "../contextPresentationRegistr
 import { useOpenPrLink } from "~/lib/openPullRequestLink";
 import type { ChatMarkdownContextReference } from "../ChatMarkdown";
 import { useMediaQuery } from "~/hooks/useMediaQuery";
+import { useClientSettings } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@t3tools/contracts/settings";
@@ -347,7 +348,7 @@ function TimelineLoadEarlierHeader({
 }) {
   return (
     <div className={fade ? "pt-[var(--workspace-titlebar-scroll-fade-height)]" : "pt-3 sm:pt-4"}>
-      <div className="mx-auto w-full max-w-3xl pb-2">
+      <div className="mx-auto w-full max-w-(--chat-content-max-width) pb-2">
         <button
           type="button"
           onClick={onLoadEarlier}
@@ -545,6 +546,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   );
   const restoringThreadPosition = positionedThreadKey !== listIdentityKey;
   const prefersReducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
+  // The column width drives the minimap's gutter math, which mirrors the
+  // `--chat-content-max-width` the composer and rows are laid out with.
+  const chatContentWidthPercent = useClientSettings((settings) => settings.chatContentWidthPercent);
   const listIdentityRef = useRef(listIdentityKey);
   const previousLatestTurnRef = useRef(latestTurn);
   // The list stays mounted across thread switches. Its first end pins on the
@@ -1106,11 +1110,16 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
     const measure = () => {
       const viewportWidth = timelineViewportElement.getBoundingClientRect().width;
-      const nextHasPersistentGutter = resolveTimelineMinimapHasPersistentGutter(viewportWidth);
+      const nextHasPersistentGutter = resolveTimelineMinimapHasPersistentGutter(
+        viewportWidth,
+        chatContentWidthPercent,
+      );
       setMinimapHasPersistentGutter((current) =>
         current === nextHasPersistentGutter ? current : nextHasPersistentGutter,
       );
-      setMinimapHitStripWidth(resolveTimelineMinimapHitStripWidth(viewportWidth));
+      setMinimapHitStripWidth(
+        resolveTimelineMinimapHitStripWidth(viewportWidth, chatContentWidthPercent),
+      );
       reportContentOverflow();
     };
 
@@ -1123,7 +1132,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [timelineViewportElement, rows.length, reportContentOverflow]);
+  }, [timelineViewportElement, rows.length, reportContentOverflow, chatContentWidthPercent]);
 
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
@@ -1236,7 +1245,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   // from TimelineRowCtx, which propagates through LegendList's memo.
   const renderItem = useCallback(
     ({ item }: { item: MessagesTimelineRow }) => (
-      <div className="mx-auto w-full min-w-0 max-w-3xl overflow-x-clip" data-timeline-root="true">
+      // The conversation column's only width authority on the timeline side.
+      <div
+        className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width) overflow-x-clip"
+        data-timeline-root="true"
+      >
         <TimelineRowContent row={item} />
       </div>
     ),
@@ -1861,7 +1874,7 @@ function ContextCompactionTimelineRow({
     <div
       role="separator"
       aria-label={row.label}
-      className="mx-auto flex w-full max-w-3xl items-center gap-3 py-1 text-muted-foreground text-xs"
+      className="mx-auto flex w-full items-center gap-3 py-1 text-muted-foreground text-xs"
     >
       <span className="h-px flex-1 bg-border/70" />
       <span className="flex shrink-0 items-center gap-1.5">

@@ -197,6 +197,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["colors borders interface"],
   },
   {
+    // Prefixed because the slider control already owns the `chat-content-width` id.
+    id: "setting-chat-content-width",
+    title: "Chat width",
+    to: "/settings/appearance",
+    searchTerms: ["conversation column timeline composer wide full window narrow messages width"],
+  },
+  {
     // Prefixed because the slider control already owns the `glass-opacity` id.
     id: "setting-glass-opacity",
     title: "Glass opacity",

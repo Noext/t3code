@@ -487,6 +487,26 @@ describe("ClientSettings glass opacity", () => {
   });
 });
 
+describe("ClientSettings chat content width", () => {
+  it("defaults to half the pane", () => {
+    expect(decodeClientSettings({}).chatContentWidthPercent).toBe(50);
+  });
+
+  it.each([19, 101, 62.5])("rejects an invalid chat content width: %s", (value) => {
+    expect(() => decodeClientSettings({ chatContentWidthPercent: value })).toThrow();
+    expect(() => decodeClientSettingsPatch({ chatContentWidthPercent: value })).toThrow();
+  });
+
+  it.each([20, 80, 100])("accepts a chat content width in range: %s", (value) => {
+    expect(decodeClientSettings({ chatContentWidthPercent: value }).chatContentWidthPercent).toBe(
+      value,
+    );
+    expect(
+      decodeClientSettingsPatch({ chatContentWidthPercent: value }).chatContentWidthPercent,
+    ).toBe(value);
+  });
+});
+
 describe("ClientSettings appearance contrast", () => {
   it("defaults to the theme's original contrast", () => {
     expect(decodeClientSettings({}).appearanceContrast).toBe(100);

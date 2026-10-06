@@ -42,7 +42,7 @@ import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 const TIMELINE_MINIMAP_ITEM_SPACING = 8;
 export const TIMELINE_MINIMAP_MIN_ITEMS = 2;
 const TIMELINE_MINIMAP_MAX_HEIGHT_CSS = "calc(100vh - 18rem)";
-const TIMELINE_CONTENT_MAX_WIDTH = 768;
+const TIMELINE_CONTENT_MIN_WIDTH = 768;
 const TIMELINE_MINIMAP_PERSISTENT_GUTTER = 48;
 
 function singleToolCallLabel(entry: WorkLogEntry): string {
@@ -233,12 +233,23 @@ export function resolveTimelineMinimapCurrentIndex(input: {
   return precedingIndex;
 }
 
-export function resolveTimelineMinimapHasPersistentGutter(viewportWidth: number): boolean {
+/**
+ * The rendered conversation column width, mirroring `--chat-content-max-width`:
+ * the preference widens the column but never shrinks it below its 48rem floor.
+ */
+function resolveTimelineContentWidth(viewportWidth: number, contentWidthPercent: number): number {
+  return Math.max(TIMELINE_CONTENT_MIN_WIDTH, (viewportWidth * contentWidthPercent) / 100);
+}
+
+export function resolveTimelineMinimapHasPersistentGutter(
+  viewportWidth: number,
+  contentWidthPercent: number,
+): boolean {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) {
     return false;
   }
 
-  const contentWidth = Math.min(viewportWidth, TIMELINE_CONTENT_MAX_WIDTH);
+  const contentWidth = resolveTimelineContentWidth(viewportWidth, contentWidthPercent);
   const sideGutter = Math.max(0, (viewportWidth - contentWidth) / 2);
   return sideGutter >= TIMELINE_MINIMAP_PERSISTENT_GUTTER;
 }
@@ -254,12 +265,15 @@ const TIMELINE_MINIMAP_EXPANDED_HIT_STRIP_WIDTH = "22rem";
  * text and swallow its pointer events. Cap the strip's width so it never
  * extends past the gutter into the content column; 0 disables the strip.
  */
-export function resolveTimelineMinimapHitStripWidth(viewportWidth: number): number {
+export function resolveTimelineMinimapHitStripWidth(
+  viewportWidth: number,
+  contentWidthPercent: number,
+): number {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) {
     return 0;
   }
 
-  const contentWidth = Math.min(viewportWidth, TIMELINE_CONTENT_MAX_WIDTH);
+  const contentWidth = resolveTimelineContentWidth(viewportWidth, contentWidthPercent);
   const sideGutter = Math.max(0, (viewportWidth - contentWidth) / 2);
   return Math.max(
     0,

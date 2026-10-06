@@ -20,6 +20,12 @@ Android uses **Material You Layout** by default unless you have turned it off in
 It changes shapes, spacing, and controls independently
 of the selected theme.
 
+## Chat width
+
+**Chat width** in **Settings → Appearance** sets how much of the window the conversation column may
+fill. The column keeps a 48rem floor, so the slider only widens it on large windows and leaves
+phones and narrow panes alone.
+
 ## Motion
 
 The main sidebar, right panel, and terminal drawer open and close immediately by default. Move the

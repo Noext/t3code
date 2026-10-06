@@ -655,22 +655,27 @@ describe("MessagesTimeline", () => {
         itemBounds: [{ top: 80, height: 20 }],
       }),
     ).toBeNull();
-    expect(resolveTimelineMinimapHasPersistentGutter(832)).toBe(false);
-    expect(resolveTimelineMinimapHasPersistentGutter(863)).toBe(false);
-    expect(resolveTimelineMinimapHasPersistentGutter(864)).toBe(true);
+    expect(resolveTimelineMinimapHasPersistentGutter(832, 40)).toBe(false);
+    expect(resolveTimelineMinimapHasPersistentGutter(863, 40)).toBe(false);
+    expect(resolveTimelineMinimapHasPersistentGutter(864, 40)).toBe(true);
+    // A wider column ceiling leaves less gutter, so the rail goes inert sooner.
+    expect(resolveTimelineMinimapHasPersistentGutter(1400, 100)).toBe(false);
+    expect(resolveTimelineMinimapHasPersistentGutter(1920, 80)).toBe(true);
 
     // No usable gutter (zoomed in / narrow pane): the strip must go inert
     // instead of overlaying the centered content column.
-    expect(resolveTimelineMinimapHitStripWidth(768)).toBe(0);
-    expect(resolveTimelineMinimapHitStripWidth(792)).toBe(0);
+    expect(resolveTimelineMinimapHitStripWidth(768, 40)).toBe(0);
+    expect(resolveTimelineMinimapHitStripWidth(792, 40)).toBe(0);
     // Partial gutter: strip shrinks to what fits between the viewport edge
     // and the content column.
-    expect(resolveTimelineMinimapHitStripWidth(820)).toBe(14);
+    expect(resolveTimelineMinimapHitStripWidth(820, 40)).toBe(14);
     // Full gutter: unchanged 40px-wide strip.
-    expect(resolveTimelineMinimapHitStripWidth(872)).toBe(40);
-    expect(resolveTimelineMinimapHitStripWidth(1400)).toBe(40);
-    expect(resolveTimelineMinimapHitStripWidth(0)).toBe(0);
-    expect(resolveTimelineMinimapHitStripWidth(Number.NaN)).toBe(0);
+    expect(resolveTimelineMinimapHitStripWidth(872, 40)).toBe(40);
+    expect(resolveTimelineMinimapHitStripWidth(1400, 40)).toBe(40);
+    // A full-width column eats the whole gutter.
+    expect(resolveTimelineMinimapHitStripWidth(1400, 100)).toBe(0);
+    expect(resolveTimelineMinimapHitStripWidth(0, 40)).toBe(0);
+    expect(resolveTimelineMinimapHitStripWidth(Number.NaN, 40)).toBe(0);
 
     // The collapsed target stays narrow, but an open preview keeps its full
     // 20rem width plus the 2rem offset from the minimap rail interactive.

@@ -82,6 +82,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --appearance-contrast-boost: 0%;
   --appearance-contrast-border-boost: 0%;
   --appearance-contrast-target: black;
+  /* Conversation column ceiling; mirrored by `chatContentWidth.ts`. */
+  --chat-content-max-width: max(48rem, 50%);
   --app-scrollbar-thumb: rgb(217 217 217);
   --app-scrollbar-thumb-hover: rgb(191 191 191);
   /*

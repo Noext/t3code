@@ -96,6 +96,22 @@ export const GlassOpacity = Schema.Int.check(
 export type GlassOpacity = typeof GlassOpacity.Type;
 const DEFAULT_GLASS_OPACITY: GlassOpacity = 80;
 
+/**
+ * Share of the chat pane the conversation column may grow to. The column keeps
+ * a 48rem floor, so only the lower half of the range widens it at all, and only
+ * on panes wide enough for the share to beat that floor.
+ */
+export const MIN_CHAT_CONTENT_WIDTH_PERCENT = 20;
+export const MAX_CHAT_CONTENT_WIDTH_PERCENT = 100;
+export const ChatContentWidthPercent = Schema.Int.check(
+  Schema.isBetween({
+    minimum: MIN_CHAT_CONTENT_WIDTH_PERCENT,
+    maximum: MAX_CHAT_CONTENT_WIDTH_PERCENT,
+  }),
+);
+export type ChatContentWidthPercent = typeof ChatContentWidthPercent.Type;
+const DEFAULT_CHAT_CONTENT_WIDTH_PERCENT: ChatContentWidthPercent = 50;
+
 export const MIN_APPEARANCE_CONTRAST = 50;
 export const MAX_APPEARANCE_CONTRAST = 200;
 export const AppearanceContrast = Schema.Int.check(
@@ -299,6 +315,9 @@ export const ClientSettingsSchema = Schema.Struct({
   loadBalancingWeights: LoadBalancingWeights.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   appearanceContrast: AppearanceContrast.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_APPEARANCE_CONTRAST)),
+  ),
+  chatContentWidthPercent: ChatContentWidthPercent.pipe(
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_CHAT_CONTENT_WIDTH_PERCENT)),
   ),
   // Panel motion defaults to zero because width and height transitions cause
   // layout work on every frame, which is noticeable on lower-power clients.
@@ -1552,6 +1571,7 @@ export const ClientSettingsPatch = Schema.Struct({
   loadBalancingEnabled: Schema.optionalKey(Schema.Boolean),
   loadBalancingWeights: Schema.optionalKey(LoadBalancingWeights),
   appearanceContrast: Schema.optionalKey(AppearanceContrast),
+  chatContentWidthPercent: Schema.optionalKey(ChatContentWidthPercent),
   panelAnimationDurationMs: Schema.optionalKey(PanelAnimationDurationMs),
   browserDefaultViewport: Schema.optionalKey(PreviewViewportSetting),
   browserDefaultZoomFactor: Schema.optionalKey(PreviewZoomFactor),

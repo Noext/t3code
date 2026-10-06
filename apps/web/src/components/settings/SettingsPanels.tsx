@@ -24,6 +24,7 @@ import {
   type DiffLayout,
   type EnvironmentIdentificationMode,
   MAX_APPEARANCE_CONTRAST,
+  MAX_CHAT_CONTENT_WIDTH_PERCENT,
   MAX_CODE_FONT_SIZE,
   MAX_GLASS_OPACITY,
   MAX_INTERFACE_FONT_SIZE,
@@ -31,8 +32,9 @@ import {
   MAX_PROMPT_FONT_SIZE,
   MAX_SIDEBAR_AUTO_SETTLE_AFTER_DAYS,
   MAX_TERMINAL_FONT_SIZE,
-  MIN_CODE_FONT_SIZE,
   MIN_APPEARANCE_CONTRAST,
+  MIN_CHAT_CONTENT_WIDTH_PERCENT,
+  MIN_CODE_FONT_SIZE,
   MIN_GLASS_OPACITY,
   MIN_INTERFACE_FONT_SIZE,
   MIN_PANEL_ANIMATION_DURATION_MS,
@@ -528,6 +530,9 @@ export function useSettingsRestore(onRestored?: () => void) {
         ? ["Contrast"]
         : []),
       ...(settings.glassOpacity !== DEFAULT_UNIFIED_SETTINGS.glassOpacity ? ["Glass opacity"] : []),
+      ...(settings.chatContentWidthPercent !== DEFAULT_UNIFIED_SETTINGS.chatContentWidthPercent
+        ? ["Chat width"]
+        : []),
       ...(settings.diffColorScheme !== DEFAULT_UNIFIED_SETTINGS.diffColorScheme
         ? ["Diff colors"]
         : []),
@@ -637,6 +642,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.browserLinkTarget,
       settings.browserAutoShowFloatingPreview,
       settings.appearanceContrast,
+      settings.chatContentWidthPercent,
       settings.diffColorScheme,
       settings.enableAgentBrowserAccess,
       settings.confirmQuit,
@@ -765,6 +771,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
+      chatContentWidthPercent: DEFAULT_UNIFIED_SETTINGS.chatContentWidthPercent,
       panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
       sidebarThreadPreviewCount: DEFAULT_UNIFIED_SETTINGS.sidebarThreadPreviewCount,
       sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
@@ -1171,6 +1178,13 @@ export function AppearanceSettingsPanel() {
     "--settings-slider-progress": `${panelAnimationDurationRatio * 100}%`,
     "--settings-slider-fill-offset": `${0.5 - panelAnimationDurationRatio}rem`,
   } as CSSProperties;
+  const chatContentWidthRatio =
+    (settings.chatContentWidthPercent - MIN_CHAT_CONTENT_WIDTH_PERCENT) /
+    (MAX_CHAT_CONTENT_WIDTH_PERCENT - MIN_CHAT_CONTENT_WIDTH_PERCENT);
+  const chatContentWidthSliderStyle = {
+    "--settings-slider-progress": `${chatContentWidthRatio * 100}%`,
+    "--settings-slider-fill-offset": `${0.5 - chatContentWidthRatio}rem`,
+  } as CSSProperties;
 
   return (
     <SettingsPageContainer>
@@ -1236,6 +1250,55 @@ export function AppearanceSettingsPanel() {
                 style={appearanceContrastSliderStyle}
                 type="range"
                 value={settings.appearanceContrast}
+              />
+            </div>
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("setting-chat-content-width")}
+          description="How much of the window the conversation column may fill. It keeps a 48rem minimum, so only wide windows change."
+          resetAction={
+            settings.chatContentWidthPercent !==
+            DEFAULT_UNIFIED_SETTINGS.chatContentWidthPercent ? (
+              <SettingResetButton
+                label="chat width"
+                onClick={() =>
+                  updateSettings({
+                    chatContentWidthPercent: DEFAULT_UNIFIED_SETTINGS.chatContentWidthPercent,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <div className="flex w-full items-center gap-3 sm:w-52">
+              <output
+                className="min-w-12 rounded-md bg-muted px-2 py-1 text-center font-mono text-xs font-medium tabular-nums text-foreground"
+                htmlFor="chat-content-width"
+              >
+                {settings.chatContentWidthPercent}%
+              </output>
+              <input
+                aria-label="Chat width"
+                className="settings-slider min-w-0 flex-1"
+                id="chat-content-width"
+                max={MAX_CHAT_CONTENT_WIDTH_PERCENT}
+                min={MIN_CHAT_CONTENT_WIDTH_PERCENT}
+                onChange={(event) => {
+                  const chatContentWidthPercent = Number(event.currentTarget.value);
+                  if (
+                    Number.isInteger(chatContentWidthPercent) &&
+                    chatContentWidthPercent >= MIN_CHAT_CONTENT_WIDTH_PERCENT &&
+                    chatContentWidthPercent <= MAX_CHAT_CONTENT_WIDTH_PERCENT
+                  ) {
+                    updateSettings({ chatContentWidthPercent });
+                  }
+                }}
+                step={5}
+                style={chatContentWidthSliderStyle}
+                type="range"
+                value={settings.chatContentWidthPercent}
               />
             </div>
           }

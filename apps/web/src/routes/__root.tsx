@@ -44,6 +44,7 @@ import {
 import { resolveAndPersistPreferredEditor } from "../editorPreferences";
 import { applyAppearanceFontVariables } from "~/appearanceFonts";
 import { applyAppearanceContrast } from "~/appearanceContrast";
+import { applyChatContentWidth } from "~/chatContentWidth";
 import { useClientSettings } from "../hooks/useSettings";
 import { PlanAgentSelectionHeal } from "../planAgentSelectionHeal";
 import {
@@ -211,6 +212,7 @@ function RootRouteView() {
         <ContrastAppearanceSync />
         <EnvironmentThemeSync />
         <GlassAppearanceSync />
+        <ChatLayoutSync />
         <FontAppearanceSync />
         <FirstRunGate
           enabled={primaryEnvironmentAuthenticated}
@@ -263,6 +265,16 @@ function ContrastAppearanceSync() {
   useEffect(() => {
     applyAppearanceContrast(document.documentElement, appearanceContrast);
   }, [appearanceContrast]);
+
+  return null;
+}
+
+function ChatLayoutSync() {
+  const chatContentWidthPercent = useClientSettings((settings) => settings.chatContentWidthPercent);
+
+  useEffect(() => {
+    applyChatContentWidth(document.documentElement, chatContentWidthPercent);
+  }, [chatContentWidthPercent]);
 
   return null;
 }
