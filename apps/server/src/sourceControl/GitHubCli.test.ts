@@ -9,7 +9,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { VcsProcessExitError, VcsProcessSpawnError } from "@t3tools/contracts";
+import { VcsProcessExitError, VcsProcessSpawnError, type VcsError } from "@t3tools/contracts";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as GitHubCli from "./GitHubCli.ts";
@@ -31,13 +31,36 @@ const quotaOutput = (remaining = 5000, resetAt = "2099-01-01T00:00:00Z") =>
     JSON.stringify({ data: { rateLimit: { cost: 1, limit: 5000, remaining, resetAt } } }),
   );
 
+const isAuthStatusProbe = (args: ReadonlyArray<string>): boolean =>
+  args[0] === "auth" && args[1] === "status";
+const isAuthTokenProbe = (args: ReadonlyArray<string>): boolean =>
+  args[0] === "auth" && args[1] === "token";
+const isQuotaProbe = (args: ReadonlyArray<string>): boolean =>
+  args[0] === "api" && args[1] === "rate_limit";
+
+/**
+ * Answers the account probes `GitHubCli` runs for itself with a machine that has no account signed
+ * in, so a test only observes the command under test. `undefined` means "this is a real command".
+ */
+const signedOutProbeOutput = (
+  input: VcsProcess.VcsProcessInput,
+): VcsProcess.VcsProcessOutput | undefined => {
+  if (isAuthStatusProbe(input.args)) return processOutput(JSON.stringify({ hosts: {} }));
+  return isAuthTokenProbe(input.args)
+    ? { ...processOutput(""), exitCode: ChildProcessSpawner.ExitCode(1) }
+    : undefined;
+};
+
 const mockRun = vi.fn<VcsProcess.VcsProcess["Service"]["run"]>();
 
 const layer = GitHubCli.layer.pipe(
   Layer.provide(
     Layer.mock(VcsProcess.VcsProcess)({
-      run: (input) =>
-        input.args[1] === "rate_limit" ? Effect.succeed(quotaOutput()) : mockRun(input),
+      run: (input) => {
+        const probe = signedOutProbeOutput(input);
+        if (probe !== undefined) return Effect.succeed(probe);
+        return isQuotaProbe(input.args) ? Effect.succeed(quotaOutput()) : mockRun(input);
+      },
     }),
   ),
 );
@@ -63,6 +86,8 @@ it.effect("shares quota checks, preserves the reserve, and resumes after reset",
               assert.strictEqual(input.args[3], "enterprise.test");
               return quotaOutput(remaining, resetAt);
             }
+            const probe = signedOutProbeOutput(input);
+            if (probe !== undefined) return probe;
             commands.push(input.args.slice(0, 2).join(" "));
             return processOutput("[]");
           }),
@@ -118,6 +143,8 @@ describe("GitHubCli.layer", () => {
             Effect.sync(() => {
               if (input.args[1] === "rate_limit")
                 return quotaOutput(input.env?.GH_TOKEN === "empty" ? 0 : 5000);
+              const probe = signedOutProbeOutput(input);
+              if (probe !== undefined) return probe;
               reads++;
               return processOutput("[]");
             }),
@@ -636,4 +663,250 @@ describe("GitHubCli.layer", () => {
       expect(mockRun).toHaveBeenCalledTimes(2);
     }).pipe(Effect.provide(layer)),
   );
+});
+
+interface FakeGitHubAccount {
+  readonly login: string;
+  readonly token?: string;
+  readonly active?: boolean;
+}
+
+/**
+ * A `gh` with several accounts signed in on github.com. `onCommand` stands in for the command
+ * under test and receives the environment the layer built for it.
+ */
+const fakeGitHub = (
+  accounts: ReadonlyArray<FakeGitHubAccount>,
+  onCommand: (
+    input: VcsProcess.VcsProcessInput,
+  ) => Effect.Effect<VcsProcess.VcsProcessOutput, VcsError> = () =>
+    Effect.succeed(processOutput("{}")),
+) => {
+  const calls: Array<VcsProcess.VcsProcessInput> = [];
+  const service: VcsProcess.VcsProcess["Service"] = {
+    run: (input) => {
+      calls.push(input);
+      if (isAuthStatusProbe(input.args)) {
+        return Effect.succeed(
+          processOutput(
+            JSON.stringify({
+              hosts: {
+                "github.com": accounts.map((account) => ({
+                  state: "success",
+                  active: account.active ?? false,
+                  host: "github.com",
+                  login: account.login,
+                })),
+              },
+            }),
+          ),
+        );
+      }
+      if (isAuthTokenProbe(input.args)) {
+        const login = input.args[input.args.indexOf("--user") + 1];
+        const token = accounts.find((account) => account.login === login)?.token;
+        return Effect.succeed(
+          token === undefined
+            ? { ...processOutput(""), exitCode: ChildProcessSpawner.ExitCode(1) }
+            : processOutput(token),
+        );
+      }
+      if (isQuotaProbe(input.args)) return Effect.succeed(quotaOutput());
+      return onCommand(input);
+    },
+  };
+  const isProbe = (call: VcsProcess.VcsProcessInput) =>
+    isAuthStatusProbe(call.args) || isAuthTokenProbe(call.args) || isQuotaProbe(call.args);
+  return {
+    service,
+    /** Real commands, without the layer's own auth and quota probes. */
+    commands: () => calls.filter((call) => !isProbe(call)),
+    tokenProbes: () => calls.filter((call) => isAuthTokenProbe(call.args)),
+    authCommands: () => calls.filter((call) => call.args[0] === "auth"),
+  };
+};
+
+const accountLayer = (service: VcsProcess.VcsProcess["Service"]) =>
+  GitHubCli.layer.pipe(Layer.provide(Layer.mock(VcsProcess.VcsProcess)(service)));
+
+const cloneUrlOutput = (input: VcsProcess.VcsProcessInput) =>
+  Effect.succeed(
+    processOutput(
+      JSON.stringify({
+        nameWithOwner: input.args[2] ?? "unknown/repository",
+        url: `https://github.com/${input.args[2] ?? "unknown/repository"}`,
+        sshUrl: `git@github.com:${input.args[2] ?? "unknown/repository"}.git`,
+      }),
+    ),
+  );
+
+const credentialsByRepository = (commands: ReadonlyArray<VcsProcess.VcsProcessInput>) =>
+  commands.map((call) => [call.args[2], call.env?.GH_TOKEN ?? null]);
+
+describe("GitHubCli account resolution", () => {
+  it.effect("pins concurrent reads to the account that owns each repository", () => {
+    const gh = fakeGitHub(
+      [
+        { login: "Noext", token: "token-noext" },
+        { login: "maxime-pharmania", token: "token-maxime", active: true },
+      ],
+      cloneUrlOutput,
+    );
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      yield* Effect.all(
+        [
+          cli.getRepositoryCloneUrls({ cwd: "/repo", repository: "Noext/trackshop" }),
+          cli.getRepositoryCloneUrls({ cwd: "/repo", repository: "maxime-pharmania/arpilabe" }),
+          // An organization the active account can read is not an account name: it must keep the
+          // ambient account instead of borrowing another account's token.
+          cli.getRepositoryCloneUrls({ cwd: "/repo", repository: "pharmania/arpilabe-pilotage" }),
+        ],
+        { concurrency: 3 },
+      );
+
+      expect(credentialsByRepository(gh.commands()).toSorted()).toEqual([
+        ["Noext/trackshop", "token-noext"],
+        ["maxime-pharmania/arpilabe", "token-maxime"],
+        ["pharmania/arpilabe-pilotage", null],
+      ]);
+      // Switching the active account is a global mutation that would make the other call wrong.
+      expect(gh.authCommands().every((call) => call.args[1] !== "switch")).toBe(true);
+    }).pipe(Effect.provide(accountLayer(gh.service)));
+  });
+
+  it.effect("leaves an owner that is not signed in on the ambient account", () => {
+    const gh = fakeGitHub(
+      [{ login: "maxime-pharmania", token: "token-maxime", active: true }],
+      cloneUrlOutput,
+    );
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      yield* cli.getRepositoryCloneUrls({ cwd: "/repo", repository: "unknown/other" });
+
+      expect(credentialsByRepository(gh.commands())).toEqual([["unknown/other", null]]);
+    }).pipe(Effect.provide(accountLayer(gh.service)));
+  });
+
+  it.effect("matches owners without regard to case and caches their token", () => {
+    const gh = fakeGitHub([{ login: "Noext", token: "token-noext" }], cloneUrlOutput);
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      yield* cli.getRepositoryCloneUrls({ cwd: "/repo", repository: "noext/trackshop" });
+      yield* cli.getRepositoryCloneUrls({ cwd: "/repo", repository: "NOEXT/trackshop" });
+
+      expect(credentialsByRepository(gh.commands())).toEqual([
+        ["noext/trackshop", "token-noext"],
+        ["NOEXT/trackshop", "token-noext"],
+      ]);
+      // One status read and one token read serve both calls.
+      expect(gh.tokenProbes()).toHaveLength(1);
+      expect(gh.tokenProbes()[0]?.args).toEqual([
+        "auth",
+        "token",
+        "--hostname",
+        "github.com",
+        "--user",
+        "Noext",
+      ]);
+    }).pipe(Effect.provide(accountLayer(gh.service)));
+  });
+
+  it.effect("reads the owner from every repository selector gh accepts", () => {
+    const gh = fakeGitHub([{ login: "Noext", token: "token-noext" }]);
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      for (const args of [
+        ["repo", "view", "Noext/trackshop"],
+        ["pr", "view", "1", "--repo", "Noext/trackshop"],
+        ["pr", "view", "1", "--repo=Noext/trackshop"],
+        ["pr", "view", "1", "-RNoext/trackshop"],
+        ["pr", "view", "https://github.com/Noext/trackshop/pull/1"],
+        ["api", "repos/Noext/trackshop/issues/1"],
+      ]) {
+        yield* cli.execute({ cwd: "/repo", args });
+      }
+
+      expect(gh.commands().map((call) => call.env?.GH_TOKEN)).toEqual(
+        Array.from({ length: 6 }, () => "token-noext"),
+      );
+    }).pipe(Effect.provide(accountLayer(gh.service)));
+  });
+
+  it.effect("pays for no account probe when a command names no repository", () => {
+    const gh = fakeGitHub([{ login: "Noext", token: "token-noext" }], () =>
+      Effect.succeed(processOutput("[]")),
+    );
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      yield* cli.listOpenPullRequests({ cwd: "/repo", headSelector: "feature/account-resolution" });
+
+      expect(gh.authCommands()).toHaveLength(0);
+      expect(gh.commands()[0]?.env).toBeUndefined();
+    }).pipe(Effect.provide(accountLayer(gh.service)));
+  });
+
+  it.effect("falls back to the ambient account when gh cannot produce a token", () => {
+    const cause = new VcsProcessExitError({
+      operation: "GitHubCli.execute",
+      command: "gh",
+      cwd: "/repo",
+      exitCode: 1,
+      failureKind: "not-found",
+      detail: "GraphQL: Could not resolve to a Repository with the name 'Noext/trackshop'.",
+    });
+    const gh = fakeGitHub(
+      [{ login: "Noext" }, { login: "maxime-pharmania", token: "token-maxime", active: true }],
+      () => Effect.fail(cause),
+    );
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      const failure = yield* cli
+        .getRepositoryCloneUrls({ cwd: "/repo", repository: "Noext/trackshop" })
+        .pipe(Effect.flip);
+
+      expect(gh.commands()[0]?.env).toBeUndefined();
+      // The command's own outcome reaches the caller instead of a resolution error.
+      expect(failure._tag).toBe("GitHubPullRequestNotFoundError");
+      const encoded = yield* encodeGitHubCliError(failure);
+      expect(encoded).not.toContain("token-maxime");
+      expect(encoded).not.toContain("token-noext");
+    }).pipe(Effect.provide(accountLayer(gh.service)));
+  });
+
+  it.effect("keeps a pinned credential scoped to its host while owners override it", () => {
+    const gh = fakeGitHub([{ login: "Noext", token: "token-noext" }]);
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      const pinned = {
+        host: "github.com",
+        token: Redacted.make("token-pinned"),
+        credentialFingerprint: "pinned-fingerprint",
+      };
+      const view = (args: ReadonlyArray<string>) =>
+        cli
+          .execute({ cwd: "/repo", args })
+          .pipe(Effect.provideService(GitHubCli.PinnedGitHubCredential, pinned));
+
+      // The pinned account cannot read another owner's repository, so that owner's token wins.
+      yield* view(["pr", "view", "1", "--repo", "github.com/Noext/trackshop"]);
+      // A repository no signed-in account owns keeps the credential the caller verified.
+      yield* view(["pr", "view", "1", "--repo", "github.com/other/repository"]);
+      expect(gh.commands().map((call) => call.env?.GH_TOKEN)).toEqual([
+        "token-noext",
+        "token-pinned",
+      ]);
+
+      const callsBefore = gh.commands().length;
+      const failure = yield* view([
+        "pr",
+        "view",
+        "1",
+        "--repo",
+        "other.example.test/other/repo",
+      ]).pipe(Effect.flip);
+      expect(failure._tag).toBe("GitHubCliCommandError");
+      expect(gh.commands()).toHaveLength(callsBefore);
+    }).pipe(Effect.provide(accountLayer(gh.service)));
+  });
 });
