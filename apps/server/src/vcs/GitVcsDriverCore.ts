@@ -31,7 +31,9 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { compactTraceAttributes } from "@t3tools/shared/observability";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
+import { GitHubAccountCredential } from "../sourceControl/GitHubAccountCredential.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import { gitRemoteAccountEnv } from "./gitRemoteAccountEnv.ts";
 import {
   parseRemoteNames,
   parseRemoteNamesInGitOrder,
@@ -782,6 +784,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const { worktreesDir } = yield* ServerConfig;
   const crypto = yield* Crypto.Crypto;
+  // Optional: callers that build this core directly (tests, CLI paths) get no account resolution
+  // and every git command keeps the authentication the machine already had.
+  const gitHubAccounts = yield* Effect.serviceOption(GitHubAccountCredential);
 
   const executeRaw: GitVcsDriver.GitVcsDriver["Service"]["execute"] = Effect.fnUntraced(
     function* (input) {
@@ -916,7 +921,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   );
 
   const execute: GitVcsDriver.GitVcsDriver["Service"]["execute"] = (input) =>
-    executeRaw(input).pipe(
+    Effect.flatMap(remoteAccountEnvironment(input), (credentialEnv) =>
+      executeRaw(
+        Object.keys(credentialEnv).length === 0
+          ? input
+          : { ...input, env: { ...input.env, ...credentialEnv } },
+      ),
+    ).pipe(
       withMetrics({
         counter: gitCommandsTotal,
         timer: gitCommandDuration,
@@ -1017,6 +1028,36 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         result.stdoutTruncated ? `${result.stdout}${OUTPUT_TRUNCATED_MARKER}` : result.stdout,
       ),
     );
+
+  /**
+   * The env a git process needs to reach its remote as the account that owns it. Resolved before
+   * the command takes a process slot, because the `gh` probe it may need is itself a child process
+   * and must not queue behind the command it is preparing.
+   */
+  const remoteAccountEnvironment = (input: {
+    readonly cwd: string;
+    readonly args: ReadonlyArray<string>;
+  }): Effect.Effect<NodeJS.ProcessEnv> => {
+    if (Option.isNone(gitHubAccounts)) return Effect.succeed<NodeJS.ProcessEnv>({});
+    const accounts = gitHubAccounts.value;
+    return gitRemoteAccountEnv({
+      args: input.args,
+      // `remote -v` is a local read, so this lookup resolves no account of its own.
+      readRemoteUrls: () =>
+        executeGit(
+          "GitVcsDriver.remoteAccountEnvironment.remoteUrls",
+          input.cwd,
+          ["remote", "-v"],
+          { allowNonZeroExit: true, timeoutMs: 10_000, maxOutputBytes: 32_000 },
+        ).pipe(
+          Effect.map((result) => parseRemoteFetchUrls(result.stdout)),
+          Effect.orElseSucceed((): ReadonlyMap<string, string> => new Map()),
+        ),
+    }).pipe(
+      Effect.provideService(GitHubAccountCredential, accounts),
+      Effect.orElseSucceed((): NodeJS.ProcessEnv => ({})),
+    );
+  };
 
   const branchExists = (cwd: string, refName: string): Effect.Effect<boolean, GitCommandError> =>
     executeGit(

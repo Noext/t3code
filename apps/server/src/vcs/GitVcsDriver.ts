@@ -38,6 +38,7 @@ import {
 } from "./GitVcsDriverCore.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
+import * as GitHubAccountCredential from "../sourceControl/GitHubAccountCredential.ts";
 
 export interface ExecuteGitInput {
   readonly operation: string;
@@ -1161,4 +1162,8 @@ export const make = Effect.gen(function* () {
 });
 
 export const vcsLayer = Layer.effect(VcsDriver.VcsDriver, makeVcsDriver);
-export const layer = Layer.effect(GitVcsDriver, make);
+export const layer = Layer.effect(GitVcsDriver, make).pipe(
+  // The account that owns a remote is resolved here, next to the git processes that need it. The
+  // driver itself speaks to `git` directly, so this layer brings its own process runner.
+  Layer.provide(GitHubAccountCredential.layer.pipe(Layer.provide(VcsProcess.layer))),
+);
