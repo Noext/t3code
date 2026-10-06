@@ -12,6 +12,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { VcsProcessExitError, VcsProcessSpawnError, type VcsError } from "@t3tools/contracts";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as GitHubAccountCredential from "./GitHubAccountCredential.ts";
 import * as GitHubCli from "./GitHubCli.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
 import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
@@ -78,6 +79,7 @@ it.effect("shares quota checks, preserves the reserve, and resumes after reset",
       DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 60_000),
     );
     const gh = yield* GitHubCli.make.pipe(
+      Effect.provide(GitHubAccountCredential.layer),
       Effect.provideService(VcsProcess.VcsProcess, {
         run: (input) =>
           Effect.sync(() => {
@@ -138,6 +140,7 @@ describe("GitHubCli.layer", () => {
     Effect.gen(function* () {
       let reads = 0;
       const gh = yield* GitHubCli.make.pipe(
+        Effect.provide(GitHubAccountCredential.layer),
         Effect.provideService(VcsProcess.VcsProcess, {
           run: (input) =>
             Effect.sync(() => {

@@ -1,5 +1,3 @@
-import * as NodeCrypto from "node:crypto";
-
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
@@ -9,7 +7,6 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
-import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
@@ -20,7 +17,13 @@ import {
 } from "@t3tools/contracts";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
-import { parseGitHubAuthStatus, type GitHubAuthStatusAccount } from "./gitHubAuthStatus.ts";
+import {
+  GitHubAccountCredential,
+  gitHubCredentialEnvironment,
+  layer as gitHubAccountCredentialLayer,
+  repositoryOwner,
+  type GitHubCredential,
+} from "./GitHubAccountCredential.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
 import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
 import {
@@ -31,18 +34,11 @@ import {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/** Server-local credential scope; never put its value in RPC payloads or cache keys. */
-export interface GitHubCliCredential {
-  readonly host: string;
-  readonly token: Redacted.Redacted<string>;
-  readonly credentialFingerprint: string;
-}
-
 /**
  * A credential the caller already proved belongs to a host, e.g. a pull request session's verified
  * account. `GitHubCli` never widens it to another host.
  */
-export const PinnedGitHubCredential = Context.Reference<GitHubCliCredential | null>(
+export const PinnedGitHubCredential = Context.Reference<GitHubCredential | null>(
   "t3/sourceControl/PinnedGitHubCredential",
   { defaultValue: () => null },
 );
@@ -84,24 +80,6 @@ function targetsVerifiedHost(args: ReadonlyArray<string>, host: string): boolean
   return hosts.length > 0 && hosts.every((target) => target === host);
 }
 
-/** `owner/name`, `host/owner/name`, or a repository URL all name the same owner. */
-function repositoryOwner(reference: string | undefined): string | null {
-  if (reference === undefined) return null;
-  const trimmed = reference.trim().replace(/\.git$/i, "");
-  if (trimmed.length === 0 || trimmed.startsWith("-")) return null;
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
-    try {
-      return new URL(trimmed).pathname.split("/").find((segment) => segment.length > 0) ?? null;
-    } catch {
-      return null;
-    }
-  }
-  const segments = trimmed.split("/").filter(Boolean);
-  if (segments.length === 2) return segments[0]!;
-  if (segments.length === 3) return segments[1]!;
-  return null;
-}
-
 /**
  * The owner of the repository a command targets, or null when the command does not name one. Only
  * repository selectors are read: a branch or pull request reference can look like `owner/name`
@@ -127,15 +105,6 @@ function commandOwner(args: ReadonlyArray<string>): string | null {
     if (owner !== null) return owner;
   }
   return null;
-}
-
-/** `gh auth token` writes the bare token; an error line or an empty answer is not a credential. */
-function authTokenFromOutput(
-  output: VcsProcess.VcsProcessOutput,
-): Redacted.Redacted<string> | null {
-  if (output.exitCode !== 0) return null;
-  const token = output.stdout.trim();
-  return token.length > 0 ? Redacted.make(token) : null;
 }
 
 const gitHubCliFailureFields = {
@@ -465,66 +434,7 @@ export const make = Effect.gen(function* () {
   const process = yield* VcsProcess.VcsProcess;
   const budget = yield* GitHubGraphQlBudget.GitHubGraphQlBudget;
   const limits = yield* SourceControlRateLimit.SourceControlRateLimit;
-
-  const accountTtl = Duration.minutes(5);
-
-  /** `gh` reports every signed-in host at once, so one cached answer covers the machine. */
-  const ghAccounts = yield* Cache.makeWith(
-    () =>
-      process
-        .run({
-          operation: "GitHubCli.authAccounts",
-          command: "gh",
-          args: ["auth", "status", "--json", "hosts"],
-          cwd: globalThis.process.cwd(),
-          env: { GH_PROMPT_DISABLED: "1", GH_DEBUG: "" },
-          allowNonZeroExit: true,
-          timeoutMs: 10_000,
-          maxOutputBytes: 32_000,
-        })
-        .pipe(
-          Effect.map((output) =>
-            parseGitHubAuthStatus(output.stdout).accounts.filter(
-              (account) => account.authenticated,
-            ),
-          ),
-          // A missing or too-old `gh` is not this layer's error to report: the command that
-          // follows reports it with the message callers already handle.
-          Effect.orElseSucceed((): ReadonlyArray<GitHubAuthStatusAccount> => []),
-        ),
-    {
-      capacity: 1,
-      // An empty answer is usually a transient or unsupported `gh`, so retry it soon.
-      timeToLive: (exit) =>
-        Exit.isSuccess(exit) && exit.value.length > 0 ? accountTtl : Duration.seconds(30),
-    },
-  );
-
-  const ghAccountTokens = yield* Cache.makeWith(
-    (key: string) => {
-      const [host, login] = key.split("\0") as [string, string];
-      return process
-        .run({
-          operation: "GitHubCli.authToken",
-          command: "gh",
-          args: ["auth", "token", "--hostname", host, "--user", login],
-          cwd: globalThis.process.cwd(),
-          env: { GH_PROMPT_DISABLED: "1", GH_DEBUG: "" },
-          allowNonZeroExit: true,
-          timeoutMs: 10_000,
-          maxOutputBytes: 4_096,
-        })
-        .pipe(
-          Effect.map(authTokenFromOutput),
-          Effect.orElseSucceed((): Redacted.Redacted<string> | null => null),
-        );
-    },
-    {
-      capacity: 32,
-      timeToLive: (exit) =>
-        Exit.isSuccess(exit) && exit.value !== null ? accountTtl : Duration.zero,
-    },
-  );
+  const accounts = yield* GitHubAccountCredential;
 
   /**
    * The credential an invocation runs under. `gh` reads a repository through whichever account is
@@ -538,7 +448,7 @@ export const make = Effect.gen(function* () {
   const resolveGitHubCredential = Effect.fn("GitHubCli.resolveCredential")(function* (input: {
     readonly args: ReadonlyArray<string>;
     readonly env?: NodeJS.ProcessEnv;
-    readonly pinned: GitHubCliCredential | null;
+    readonly pinned: GitHubCredential | null;
   }) {
     const owner = commandOwner(input.args);
     if (owner === null) return input.pinned;
@@ -549,20 +459,7 @@ export const make = Effect.gen(function* () {
       globalThis.process.env.GH_HOST ??
       "github.com"
     ).toLowerCase();
-    const accounts = yield* Cache.get(ghAccounts, "hosts");
-    const login = accounts.find(
-      (account) => account.host === host && account.account.toLowerCase() === owner.toLowerCase(),
-    )?.account;
-    if (login === undefined) return input.pinned;
-    const token = yield* Cache.get(ghAccountTokens, `${host}\0${login}`);
-    if (token === null) return input.pinned;
-    // The fingerprint format is shared with `GitHubPullRequestCli` so that rate limits and viewer
-    // identity agree on what "the same credential" means.
-    return {
-      host,
-      token,
-      credentialFingerprint: `${host}:${NodeCrypto.createHash("sha256").update(Redacted.value(token)).digest("hex")}`,
-    } satisfies GitHubCliCredential;
+    return (yield* accounts.resolveForOwner({ host, owner })) ?? input.pinned;
   });
 
   const executeRaw: GitHubCli["Service"]["execute"] = Effect.fn("GitHubCli.executeRaw")(
@@ -580,19 +477,12 @@ export const make = Effect.gen(function* () {
         ...(input.env !== undefined ? { env: input.env } : {}),
         pinned,
       });
-      const token = credential === null ? undefined : Redacted.value(credential.token);
       const env =
         credential === null
           ? input.env
           : {
               ...input.env,
-              GH_HOST: credential.host,
-              GH_TOKEN: token,
-              GITHUB_TOKEN: token,
-              GH_ENTERPRISE_TOKEN: token,
-              GITHUB_ENTERPRISE_TOKEN: token,
-              // `gh` prints request headers, and with them the token, under debug output.
-              GH_DEBUG: "",
+              ...gitHubCredentialEnvironment(credential),
             };
       return yield* process
         .run({
@@ -833,6 +723,7 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(GitHubCli, make).pipe(
+  Layer.provideMerge(gitHubAccountCredentialLayer),
   Layer.provideMerge(GitHubGraphQlBudget.layer),
   Layer.provideMerge(SourceControlRateLimit.layer),
 );
