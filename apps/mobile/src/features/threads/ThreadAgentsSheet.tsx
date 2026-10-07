@@ -44,9 +44,9 @@ export interface ThreadAgentPanel {
 export function useThreadAgentPanel(target: AgentsTarget): ThreadAgentPanel {
   const turn = useThreadTurnSubagents(target);
   // Workflow grouping runs over the whole thread roster, not the run-scoped
-  // turn roster: a workflow coordinator hangs at thread level (orchestration
-  // runId null) and `deriveThreadTurnSubagents` drops it. Direct spawns are
-  // scoped to the current turn instead, so an old turn's rows never resurface.
+  // turn roster: workflow rows carry the `workflow` block and
+  // `deriveThreadTurnSubagents` leaves them out. Direct spawns are scoped to
+  // the current turn instead, so an old turn's rows never resurface.
   const subagents = useAtomValue(
     environmentThreadDetails.threadAtom(target),
     (thread) => thread?.projection.subagents,

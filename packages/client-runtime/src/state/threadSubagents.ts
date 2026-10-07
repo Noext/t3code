@@ -8,9 +8,12 @@
  * this stays a pure fold over `runs` and `subagents`.
  *
  * Workflow rows are excluded: a provider workflow coordinator and its members
- * carry `runId: null` (a run outlives the turn that launched it), so the
- * settled-turn fallback below would otherwise adopt every workflow row as "the
- * turn". Workflows render on their own card, not in this roster.
+ * carry the `workflow` block (and usually `runId: null`, since a run outlives
+ * the turn that launched it), so the settled-turn fallback below would
+ * otherwise adopt every workflow row as "the turn". Workflows render on their
+ * own card, not in this roster. A plain subagent may also have no orchestration
+ * `runId`; it stays in the roster and is scoped like any other row, so the
+ * `workflow` block (not a null `runId`) is the discriminant.
  */
 import * as DateTime from "effect/DateTime";
 import type { OrchestrationV2Subagent, OrchestrationV2ThreadProjection } from "@t3tools/contracts";
@@ -46,7 +49,7 @@ function orderKey(subagent: Subagent): number {
 export function deriveThreadTurnSubagents(
   projection: Pick<Projection, "runs" | "subagents">,
 ): ThreadTurnSubagents | null {
-  const roster = projection.subagents.filter((subagent) => subagent.runId !== null);
+  const roster = projection.subagents.filter((subagent) => subagent.workflow === undefined);
   if (roster.length === 0) return null;
   const activeRun = resolveActiveThreadRun(projection);
   // With no live run the newest roster is still worth showing: a turn that

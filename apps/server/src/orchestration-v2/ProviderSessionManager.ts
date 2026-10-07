@@ -262,11 +262,14 @@ function sessionKey(providerSessionId: ProviderSessionId): string {
 }
 
 /**
- * Runtime requests with no provider turn belong to the live session itself.
- * Their node and transcript item are runless too, so they bypass the normal
- * per-run subscriber and are persisted by the session event pump.
+ * Events with no provider turn belong to the live session itself. Their node and
+ * transcript item are runless too, so they bypass the normal per-run subscriber
+ * and are persisted by the session event pump. Provider workflows join them:
+ * a run outlives the turn that launched it and is attributed by provider
+ * session, so its subagent rows carry `runId: null` and no run subscription can
+ * own them.
  */
-function sessionScopedRuntimeRequestThreadId(event: ProviderAdapterV2Event): ThreadId | undefined {
+function sessionScopedEventThreadId(event: ProviderAdapterV2Event): ThreadId | undefined {
   switch (event.type) {
     case "runtime_request.updated":
       return event.runtimeRequest.providerTurnId === null ? event.threadId : undefined;
@@ -278,6 +281,12 @@ function sessionScopedRuntimeRequestThreadId(event: ProviderAdapterV2Event): Thr
       return event.turnItem.runId === null &&
         (event.turnItem.type === "approval_request" || event.turnItem.type === "user_input_request")
         ? event.turnItem.threadId
+        : undefined;
+    case "subagent.updated":
+      // Only workflow rows: every other runless subagent has no session-level
+      // owner and must not be adopted here.
+      return event.subagent.runId === null && event.subagent.workflow !== undefined
+        ? event.subagent.threadId
         : undefined;
     default:
       return undefined;
@@ -1704,10 +1713,11 @@ export const layerWithOptions = (
               Effect.andThen(
                 Effect.gen(function* () {
                   // Some providers can block before a run subscriber exists
-                  // (project trust, login, or session-switch hooks). Persist
-                  // their runless request artifacts directly so the normal T3
-                  // request UI can answer them and unblock session setup.
-                  const threadId = sessionScopedRuntimeRequestThreadId(event);
+                  // (project trust, login, or session-switch hooks) and workflows
+                  // outlive the turn that launched them. Persist their runless
+                  // session-scoped artifacts directly so they reach the
+                  // projection without a live run.
+                  const threadId = sessionScopedEventThreadId(event);
                   if (threadId !== undefined) {
                     yield* Effect.gen(function* () {
                       const current = (yield* Ref.get(sessions)).get(

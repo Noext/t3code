@@ -10,10 +10,12 @@ import {
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
   type Project,
+  NodeId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderSessionId,
+  RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -3702,6 +3704,139 @@ it.effect("ProviderSessionManagerV2 persists session-scoped runtime requests wit
       assert.equal(node?.status, "waiting");
       assert.equal(turnItem?.runId, null);
       assert.equal(turnItem?.status, "waiting");
+    });
+
+    yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 persists session-scoped workflow subagents without a run", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const effect = Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const projectId = yield* idAllocator.allocate.project({
+        fixtureName: "provider-session-manager-workflow-subagent",
+      });
+      const threadId = yield* idAllocator.allocate.thread({
+        fixtureName: "provider-session-manager-workflow-subagent",
+        projectId,
+      });
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+      yield* manager.open({
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      // A workflow outlives the turn that launched it: the sweep emits this
+      // with no orchestration run, so only the session pump can persist it.
+      const runOwnedSubagentEvent: ProviderAdapterV2Event = {
+        type: "subagent.updated",
+        driver: CODEX_DRIVER,
+        subagent: {
+          id: NodeId.make("node:workflow-subagent:run-owned"),
+          threadId,
+          // A live run still owns its own subagents: the session pump must not
+          // adopt them, or a live run would persist every row twice.
+          runId: RunId.make("run:workflow-subagent:run-owned"),
+          parentNodeId: NodeId.make("node:workflow-subagent:root"),
+          origin: "provider_native",
+          createdBy: "agent",
+          driver: CODEX_DRIVER,
+          providerInstanceId: modelSelection.instanceId,
+          providerThreadId: null,
+          childThreadId: null,
+          nativeTaskRef: null,
+          prompt: "run-owned subagent",
+          title: "run-owned subagent",
+          model: null,
+          status: "running",
+          result: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+        },
+      };
+      const workflowSubagentEvent: ProviderAdapterV2Event = {
+        type: "subagent.updated",
+        driver: CODEX_DRIVER,
+        subagent: {
+          id: NodeId.make("node:workflow-subagent:coordinator"),
+          threadId,
+          runId: null,
+          parentNodeId: NodeId.make("node:workflow-subagent:root"),
+          origin: "provider_native",
+          createdBy: "agent",
+          driver: CODEX_DRIVER,
+          providerInstanceId: modelSelection.instanceId,
+          providerThreadId: null,
+          childThreadId: null,
+          nativeTaskRef: null,
+          prompt: "Adapter hardening",
+          title: "Adapter hardening",
+          model: null,
+          status: "running",
+          result: null,
+          workflow: {
+            kind: "workflow",
+            workflowName: "Adapter hardening",
+            phases: [{ index: 0, title: "Recon" }],
+            phaseIndex: null,
+            phaseTitle: null,
+            agentIndex: null,
+            runId: "recon-run",
+          },
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+        },
+      };
+      const afterSequence = yield* eventSink.latestSequence({ threadId });
+      const persistedFiber = yield* eventSink.stream({ threadId, afterSequence }).pipe(
+        Stream.filter((stored) => stored.event.type === "subagent.updated"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      const adapterEvents = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+      assert.isDefined(adapterEvents);
+      // Ordered: the run-owned row is consumed first. If the pump adopted it,
+      // the stream would capture that one instead of the workflow row.
+      yield* Queue.offer(adapterEvents!, runOwnedSubagentEvent);
+      yield* Queue.offer(adapterEvents!, workflowSubagentEvent);
+      const persisted = Array.from(yield* Fiber.join(persistedFiber));
+      assert.lengthOf(persisted, 1);
+      const firstPersisted = persisted[0]?.event;
+      assert.isTrue(firstPersisted?.type === "subagent.updated");
+      if (firstPersisted?.type === "subagent.updated") {
+        assert.equal(firstPersisted.payload.id, workflowSubagentEvent.subagent.id);
+      }
+
+      // Visible after a reload: read it back from the projection, not the stream.
+      const projection = yield* projectionStore.getThreadProjection(threadId);
+      const subagent = projection.subagents.find(
+        (candidate) => candidate.id === workflowSubagentEvent.subagent.id,
+      );
+      assert.equal(subagent?.runId, null);
+      assert.equal(subagent?.workflow?.runId, "recon-run");
+      assert.equal(subagent?.status, "running");
+      assert.isUndefined(
+        projection.subagents.find(
+          (candidate) => candidate.id === runOwnedSubagentEvent.subagent.id,
+        ),
+      );
     });
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));

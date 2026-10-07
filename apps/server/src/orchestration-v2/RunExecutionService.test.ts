@@ -230,6 +230,38 @@ it("leaves a child thread created after the root turn ended to the run that is l
   assert.isFalse(afterLate.ownedThreadIds.has(lateChild));
 });
 
+it("keeps a run-owned subagent with its run and a runless workflow row out of it", () => {
+  const threadId = ThreadId.make("thread:workflow-routing");
+  const runId = RunId.make("run:workflow-routing");
+  const identity: RunExecutionService.ProviderEventRouteIdentity = {
+    threadId,
+    runId,
+    attemptId: RunAttemptId.make("attempt:workflow-routing"),
+    providerThreadId: ProviderThreadId.make("provider-thread:workflow-routing"),
+  };
+  const state = RunExecutionService.makeProviderEventRoutingState({
+    identity,
+    providerTurnId: null,
+  });
+  const subagentEvent = (subagentRunId: RunId | null): ProviderAdapterV2Event =>
+    ({
+      type: "subagent.updated",
+      driver,
+      subagent: {
+        id: NodeId.make("node:workflow-routing"),
+        threadId,
+        runId: subagentRunId,
+        status: "running",
+      },
+    }) as ProviderAdapterV2Event;
+
+  // A live run still owns its own subagent updates.
+  assert.isTrue(RunExecutionService.routeProviderEvent(subagentEvent(runId), identity, state)[0]);
+  // A workflow row belongs to the provider session, not to whichever run is
+  // live: the session pump persists it, so no run may adopt it twice.
+  assert.isFalse(RunExecutionService.routeProviderEvent(subagentEvent(null), identity, state)[0]);
+});
+
 it("does not route a superseded attempt through a reused provider thread", () => {
   const threadId = ThreadId.make("thread:shared-runtime:restart");
   const providerThreadId = ProviderThreadId.make("provider-thread:shared-runtime:restart");

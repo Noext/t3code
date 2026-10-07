@@ -13,6 +13,19 @@ import { deriveThreadTurnSubagents, resolveSubagentPillSegment } from "./threadS
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 
+const workflow = (
+  overrides: Partial<NonNullable<OrchestrationV2Subagent["workflow"]>> = {},
+): NonNullable<OrchestrationV2Subagent["workflow"]> => ({
+  kind: "workflow",
+  workflowName: "audit_auth_flow",
+  phases: [],
+  phaseIndex: null,
+  phaseTitle: null,
+  agentIndex: null,
+  runId: "wf-run-1",
+  ...overrides,
+});
+
 function subagent(
   overrides: Omit<Partial<OrchestrationV2Subagent>, "id"> & { readonly id: string },
 ): OrchestrationV2Subagent {
@@ -100,7 +113,7 @@ describe("deriveThreadTurnSubagents", () => {
     expect(turn?.subagents).toHaveLength(3);
   });
 
-  it("ignores workflow rows, which carry no run id", () => {
+  it("ignores workflow rows even though they carry no run id", () => {
     const turn = deriveThreadTurnSubagents({
       runs: [finishedRun],
       subagents: [
@@ -111,6 +124,7 @@ describe("deriveThreadTurnSubagents", () => {
           id: "wf",
           runId: null,
           status: "running",
+          workflow: workflow(),
           updatedAt: at("2026-06-20T00:00:09.000Z"),
         }),
       ],
@@ -121,11 +135,45 @@ describe("deriveThreadTurnSubagents", () => {
     expect(turn?.subagents.map((entry) => entry.id)).toEqual(["a"]);
   });
 
+  it("keeps a runless subagent that is not a workflow in the roster", () => {
+    const turn = deriveThreadTurnSubagents({
+      runs: [finishedRun],
+      subagents: [
+        subagent({
+          id: "runless",
+          runId: null,
+          status: "completed",
+          updatedAt: at("2026-06-20T00:00:05.000Z"),
+        }),
+      ],
+    });
+
+    expect(turn?.runId).toBeNull();
+    expect(turn?.subagents.map((entry) => entry.id)).toEqual(["runless"]);
+  });
+
+  it("scopes a runless subagent out of a live run's roster", () => {
+    const turn = deriveThreadTurnSubagents({
+      runs: [activeRun],
+      subagents: [
+        subagent({ id: "active" }),
+        subagent({
+          id: "runless",
+          runId: null,
+          updatedAt: at("2026-06-20T00:00:09.000Z"),
+        }),
+      ],
+    });
+
+    expect(turn?.runId).toBe("run-1");
+    expect(turn?.subagents.map((entry) => entry.id)).toEqual(["active"]);
+  });
+
   it("returns null when the thread only ever ran a workflow", () => {
     expect(
       deriveThreadTurnSubagents({
         runs: [finishedRun],
-        subagents: [subagent({ id: "wf", runId: null, status: "completed" })],
+        subagents: [subagent({ id: "wf", runId: null, status: "completed", workflow: workflow() })],
       }),
     ).toBeNull();
   });
