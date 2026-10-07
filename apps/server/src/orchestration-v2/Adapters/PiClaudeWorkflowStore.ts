@@ -35,7 +35,7 @@
  * @module orchestration-v2/Adapters/PiClaudeWorkflowStore
  */
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -418,6 +418,13 @@ export interface PiClaudeWorkflowStoreShape {
    */
   readonly listRunsForSession: (input: {
     readonly sessionIds: ReadonlyArray<string>;
+    /**
+     * The session file being swept, when the caller knows it. The extension
+     * writes its feed beside that file, and Pi nests sessions per project
+     * unless it was launched with an explicit `--session-dir`, so the instance
+     * default is only the root those directories hang below.
+     */
+    readonly sessionFile?: string;
   }) => Effect.Effect<PiWorkflowRunListing>;
 }
 
@@ -542,7 +549,10 @@ export const makePiClaudeWorkflowStore = Effect.fn("makePiClaudeWorkflowStore")(
   const listRunsForSession: PiClaudeWorkflowStoreShape["listRunsForSession"] = (input) =>
     semaphore.withPermit(
       Effect.gen(function* () {
-        const feedsDir = join(options.sessionDir, "workflows");
+        const feedsDir = join(
+          input.sessionFile === undefined ? options.sessionDir : dirname(input.sessionFile),
+          "workflows",
+        );
         // An absent directory means the extension never ran for this instance.
         // Anything else — permissions, I/O error, a file where the directory
         // should be — is not evidence of absence, so it dies and the caller's

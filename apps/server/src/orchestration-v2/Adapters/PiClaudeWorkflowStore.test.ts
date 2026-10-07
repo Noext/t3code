@@ -170,6 +170,32 @@ it.layer(NodeServices.layer)("PiClaudeWorkflowStore", (it) => {
     }),
   );
 
+  it.effect("reads the session's own directory when Pi nested it under the root", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-claude-workflow-" });
+      // Pi nests sessions per project unless it was launched with an explicit
+      // `--session-dir`, so the feed sits below the directory the instance
+      // resolved and the sweep has to be told which session it is reading.
+      const sessionDir = path.join(root, "--root-Dev-project--");
+      yield* writeFile(feedPath(path, sessionDir, RUN_ID), record(runRecord()));
+
+      const store = yield* makePiClaudeWorkflowStore({ sessionDir: root });
+      const fromRoot = yield* store.listRunsForSession({ sessionIds: [SESSION] });
+      assert.deepEqual(fromRoot.runs, []);
+
+      const fromSession = yield* store.listRunsForSession({
+        sessionIds: [SESSION],
+        sessionFile: path.join(sessionDir, "session.jsonl"),
+      });
+      assert.deepEqual(
+        fromSession.runs.map((run) => run.runId),
+        [RUN_ID],
+      );
+    }),
+  );
+
   it.effect("reads the terminal status, its totals and its failure", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

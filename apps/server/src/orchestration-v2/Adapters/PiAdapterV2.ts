@@ -517,6 +517,12 @@ export function makePiAdapterV2(
        * invisible rather than guessed onto this thread.
        */
       let workflowSessionId: string | null = null;
+      /**
+       * Session file `get_state` reports. The extension writes its feed beside
+       * that file, so this — not the instance default — is where a session's
+       * runs live, and the store derives the directory from it.
+       */
+      let workflowSessionFile: string | null = null;
       // User Stop intentionally tears down this RPC process after aborting.
       // Keep that intent beyond turn finalization so the later stdout close is
       // not mistaken for an unexpected transport failure.
@@ -573,9 +579,13 @@ export function makePiAdapterV2(
         Queue.offer(events, event).pipe(Effect.asVoid);
 
       /** A later `get_state` (resume, rollback, fork) re-homes the delivery owner. */
-      const rememberWorkflowSessionId = (state: unknown): void => {
+      const rememberWorkflowSession = (state: unknown): void => {
         const sessionId = recordString(state, "sessionId")?.trim();
         if (sessionId !== undefined && sessionId.length > 0) workflowSessionId = sessionId;
+        const sessionFile = recordString(state, "sessionFile")?.trim();
+        if (sessionFile !== undefined && sessionFile.length > 0) {
+          workflowSessionFile = sessionFile;
+        }
       };
 
       const updateProviderSession = (
@@ -2078,7 +2088,7 @@ export function makePiAdapterV2(
           }
         }
         const stateData = yield* request({ type: "get_state" });
-        rememberWorkflowSessionId(stateData);
+        rememberWorkflowSession(stateData);
         if (!modelsDiscovered) {
           const modelsData = yield* request({ type: "get_available_models" }).pipe(
             Effect.orElseSucceed(() => undefined),
@@ -2740,7 +2750,7 @@ export function makePiAdapterV2(
                 }),
               ),
             );
-            rememberWorkflowSessionId(forkState);
+            rememberWorkflowSession(forkState);
             const forkSessionFile = recordString(forkState, "sessionFile");
             if (forkSessionFile === undefined) {
               threadState = null;
@@ -2907,7 +2917,10 @@ export function makePiAdapterV2(
           const [snapshotListing, feedListing] = yield* Effect.all(
             [
               workflowStores.snapshot.listRunsForSession({ cwd, sessionIds: [sessionId] }),
-              workflowStores.feed.listRunsForSession({ sessionIds: [sessionId] }),
+              workflowStores.feed.listRunsForSession({
+                sessionIds: [sessionId],
+                ...(workflowSessionFile === null ? {} : { sessionFile: workflowSessionFile }),
+              }),
             ],
             { concurrency: 2 },
           );
