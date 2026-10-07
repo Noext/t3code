@@ -1,17 +1,15 @@
 import { useAtomValue } from "@effect/atom-react";
+import { projectedSubagentsToRuntime } from "@t3tools/client-runtime/state/subagentRuntime";
 import type { ThreadTurnSubagents } from "@t3tools/client-runtime/state/thread-subagents";
 import {
-  isOrchestrationV2WorkActive,
-  type EnvironmentId,
-  type OrchestrationV2Subagent,
-  type ThreadId,
-} from "@t3tools/contracts";
-import { deriveSubagentElapsedMs, formatDuration } from "@t3tools/shared/orchestrationTiming";
+  deriveAgentPanelModel,
+  type AgentPanelModel,
+} from "@t3tools/client-runtime/state/workflow-groups";
+import type { EnvironmentId, OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
-import * as DateTime from "effect/DateTime";
 import * as Haptics from "expo-haptics";
-import { useEffect, useState } from "react";
-import { Platform, Pressable, ScrollView, View } from "react-native";
+import { useMemo } from "react";
+import { Platform, ScrollView, View } from "react-native";
 import { Screen, ScreenStack, ScreenStackHeaderConfig } from "react-native-screens";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -20,14 +18,49 @@ import { AppText as Text } from "../../components/AppText";
 import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import { environmentThreadDetails } from "../../state/threads";
 import { nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
-import { SubagentRow } from "./SubagentRow";
+import { AgentSheetRow } from "./AgentSheetRow";
+import { WorkflowCard } from "./WorkflowCard";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
 
 type AgentsTarget = { readonly environmentId: EnvironmentId; readonly threadId: ThreadId };
 
+/** The turn's own roster, without the thread-wide workflow grouping. */
 export function useThreadTurnSubagents(target: AgentsTarget): ThreadTurnSubagents | null {
   return useAtomValue(environmentThreadDetails.turnSubagentsAtom(target));
+}
+
+export interface ThreadAgentPanel {
+  /**
+   * Thread-level workflow cards, with direct spawns scoped to the current
+   * turn. A workflow run outlives the turn that launched it; a direct spawn
+   * does not.
+   */
+  readonly model: AgentPanelModel;
+  /** Member rows need the contract entity the model only identifies by id. */
+  readonly subagentById: ReadonlyMap<string, OrchestrationV2Subagent>;
+}
+
+export function useThreadAgentPanel(target: AgentsTarget): ThreadAgentPanel {
+  const turn = useThreadTurnSubagents(target);
+  // Workflow grouping runs over the whole thread roster, not the run-scoped
+  // turn roster: a workflow coordinator hangs at thread level (orchestration
+  // runId null) and `deriveThreadTurnSubagents` drops it. Direct spawns are
+  // scoped to the current turn instead, so an old turn's rows never resurface.
+  const subagents = useAtomValue(
+    environmentThreadDetails.threadAtom(target),
+    (thread) => thread?.projection.subagents,
+  );
+  return useMemo(() => {
+    const roster = subagents ?? [];
+    return {
+      model: deriveAgentPanelModel(
+        projectedSubagentsToRuntime(roster),
+        projectedSubagentsToRuntime(turn?.subagents ?? []),
+      ),
+      subagentById: new Map(roster.map((subagent) => [subagent.id, subagent])),
+    };
+  }, [subagents, turn]);
 }
 
 export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
@@ -35,9 +68,8 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const theme = useUniwindTheme();
-  const turn = useThreadTurnSubagents(target);
-  const subagents = turn?.subagents ?? [];
-  const hasLiveAgent = (turn?.liveCount ?? 0) > 0;
+  const { model, subagentById } = useThreadAgentPanel(target);
+  const hasLiveAgent = model.liveCount > 0;
 
   const openChildThread = (childThreadId: ThreadId) => {
     void Haptics.selectionAsync();
@@ -60,20 +92,42 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
       contentContainerClassName="px-5 pb-6"
       contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
     >
-      {subagents.length === 0 ? (
+      {!model.hasAgents ? (
         <Text className="pt-6 text-center text-sm text-foreground-muted">
           No agents in this turn.
         </Text>
       ) : (
-        subagents.map((subagent) => (
-          <AgentRow
-            key={subagent.id}
-            subagent={subagent}
-            environmentId={target.environmentId}
-            tickSeconds={hasLiveAgent}
-            onOpen={openChildThread}
-          />
-        ))
+        <>
+          {model.workflows.map((group) => (
+            <WorkflowCard
+              key={group.workflow.id}
+              group={group}
+              subagentById={subagentById}
+              environmentId={target.environmentId}
+              tickSeconds={hasLiveAgent}
+              onOpen={openChildThread}
+            />
+          ))}
+          {model.workflows.length > 0 && model.directAgents.length > 0 ? (
+            <Text className="px-1 pb-1 pt-2 text-2xs font-t3-medium uppercase tracking-wide text-foreground-muted">
+              Direct spawns
+            </Text>
+          ) : null}
+          {model.directAgents.map((agent) => {
+            const subagent = subagentById.get(agent.id);
+            // Silent degradation: a member the roster dropped renders nothing.
+            if (subagent === undefined) return null;
+            return (
+              <AgentSheetRow
+                key={agent.id}
+                environmentId={target.environmentId}
+                subagent={subagent}
+                tickSeconds={hasLiveAgent}
+                onOpen={openChildThread}
+              />
+            );
+          })}
+        </>
       )}
     </ScrollView>
   );
@@ -116,82 +170,4 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
       {content}
     </View>
   );
-}
-
-function AgentRow(props: {
-  readonly environmentId: EnvironmentId;
-  readonly subagent: OrchestrationV2Subagent;
-  readonly tickSeconds: boolean;
-  readonly onOpen: (childThreadId: ThreadId) => void;
-}) {
-  const { subagent } = props;
-  const childThreadId = subagent.childThreadId;
-
-  const row = (
-    <View className="border-b border-border py-3.5">
-      <SubagentRow
-        environmentId={props.environmentId}
-        subagent={subagent}
-        elapsed={<AgentElapsed subagent={subagent} tickSeconds={props.tickSeconds} />}
-      />
-    </View>
-  );
-
-  if (childThreadId === null) {
-    return (
-      <View
-        accessible
-        accessibilityHint="Provider-managed agent. Its work appears in the transcript."
-      >
-        {row}
-      </View>
-    );
-  }
-
-  return (
-    <Pressable
-      accessibilityRole="link"
-      accessibilityHint="Opens this agent's thread"
-      onPress={() => props.onOpen(childThreadId)}
-      className="active:opacity-70"
-    >
-      {row}
-    </Pressable>
-  );
-}
-
-function AgentElapsed(props: {
-  readonly subagent: OrchestrationV2Subagent;
-  readonly tickSeconds: boolean;
-}) {
-  const elapsed = useSubagentElapsed(props.subagent, props.tickSeconds);
-  return elapsed === null ? null : (
-    <Text className="shrink-0 text-xs tabular-nums text-foreground-muted">{elapsed}</Text>
-  );
-}
-
-/**
- * Elapsed time for one agent. Only live work ticks, inside AgentElapsed,
- * so the timer never repaints the metadata or a settled sheet.
- */
-function useSubagentElapsed(
-  subagent: Pick<OrchestrationV2Subagent, "status" | "startedAt" | "completedAt">,
-  tickSeconds: boolean,
-): string | null {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  const running = isOrchestrationV2WorkActive(subagent.status);
-  useEffect(() => {
-    if (!tickSeconds || !running) return;
-    const intervalId = setInterval(() => setNowMs(Date.now()), 1_000);
-    return () => clearInterval(intervalId);
-  }, [running, tickSeconds]);
-  const elapsedMs = deriveSubagentElapsedMs(
-    {
-      status: subagent.status,
-      startedAt: subagent.startedAt === null ? null : DateTime.formatIso(subagent.startedAt),
-      completedAt: subagent.completedAt === null ? null : DateTime.formatIso(subagent.completedAt),
-    },
-    nowMs,
-  );
-  return elapsedMs === null || elapsedMs === 0 ? null : formatDuration(elapsedMs);
 }

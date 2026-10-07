@@ -66,6 +66,7 @@ import {
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { OrchestrationProjectShell } from "./orchestrationProject.ts";
 import {
+  TaskWorkflowPhase,
   TurnTokenUsage,
   ToolActivitySurface,
   ToolActivityIcon,
@@ -660,6 +661,27 @@ export const OrchestrationV2ExecutionNode = Schema.Struct({
 });
 export type OrchestrationV2ExecutionNode = typeof OrchestrationV2ExecutionNode.Type;
 
+/**
+ * Present on subagents driven by a provider workflow engine (Pi's
+ * `@quintinshaw/pi-dynamic-workflows` and `pi-workflows-claude`). A coordinator
+ * (`kind: "workflow"`) carries the run's full phase list; its member agents
+ * (`kind: "workflow_agent"`) hang off it through `parentNodeId` and carry the
+ * phase they ran in. `runId` is the workflow engine's own run id, kept apart
+ * from the orchestration `runId`: a workflow can outlive the turn that launched
+ * it, and clients render that id as the card's run suffix. Absent on every
+ * non-workflow subagent.
+ */
+export const OrchestrationV2SubagentWorkflow = Schema.Struct({
+  kind: Schema.Literals(["workflow", "workflow_agent"]),
+  workflowName: Schema.NullOr(Schema.String),
+  phases: Schema.Array(TaskWorkflowPhase),
+  phaseIndex: Schema.NullOr(NonNegativeInt),
+  phaseTitle: Schema.NullOr(Schema.String),
+  agentIndex: Schema.NullOr(NonNegativeInt),
+  runId: Schema.NullOr(Schema.String),
+});
+export type OrchestrationV2SubagentWorkflow = typeof OrchestrationV2SubagentWorkflow.Type;
+
 export const OrchestrationV2Subagent = Schema.Struct({
   id: NodeId,
   threadId: ThreadId,
@@ -694,6 +716,7 @@ export const OrchestrationV2Subagent = Schema.Struct({
   ]),
   progress: Schema.optional(Schema.String),
   result: Schema.NullOr(Schema.String),
+  workflow: Schema.optionalKey(OrchestrationV2SubagentWorkflow),
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   updatedAt: Schema.DateTimeUtc,

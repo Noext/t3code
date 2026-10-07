@@ -24,6 +24,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
@@ -42,6 +43,7 @@ import {
 import { handoffBudget } from "../ContextHandoffBudget.ts";
 import { makePiAdapterV2, PI_PROVIDER } from "./PiAdapterV2.ts";
 import { makePiRpcConnection, type PiRpcRecord } from "./PiRpc.ts";
+import { piWorkflowProjectKey } from "./PiWorkflowStore.ts";
 
 const layerServerConfig = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-pi-v2-adapter-",
@@ -310,7 +312,18 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   } satisfies FakePi;
 });
 
-const makeAdapter = Effect.fnUntraced(function* (fake: FakePi, launchArgs = "", forkFake?: FakePi) {
+interface PiWorkflowTestOptions {
+  readonly storeRoot: string;
+  readonly sessionDir: string;
+  readonly intervalMs: number;
+}
+
+const makeAdapter = Effect.fnUntraced(function* (
+  fake: FakePi,
+  launchArgs = "",
+  forkFake?: FakePi,
+  workflow?: PiWorkflowTestOptions,
+) {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -329,6 +342,13 @@ const makeAdapter = Effect.fnUntraced(function* (fake: FakePi, launchArgs = "", 
     fileSystem,
     idAllocator,
     serverConfig,
+    ...(workflow === undefined
+      ? {}
+      : {
+          workflowStoreRoot: workflow.storeRoot,
+          workflowSessionDir: workflow.sessionDir,
+          workflowSweepIntervalMs: workflow.intervalMs,
+        }),
   });
 });
 
@@ -338,8 +358,9 @@ const openRuntime = Effect.fnUntraced(function* (
   threadId = THREAD_ID,
   providerSessionId = SESSION_ID,
   forkFake?: FakePi,
+  workflow?: PiWorkflowTestOptions,
 ) {
-  const adapter = yield* makeAdapter(fake, "", forkFake);
+  const adapter = yield* makeAdapter(fake, "", forkFake, workflow);
   const runtime = yield* adapter.openSession({
     threadId,
     providerSessionId,
@@ -481,6 +502,98 @@ describe("PiAdapterV2", () => {
         sessionError.type === "provider_session.updated" &&
           sessionError.providerSession.lastError?.includes("invisible tool execution") === true,
       );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("publishes Pi workflow runs as workflow subagents from the run store", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const fake = yield* makeFakePi;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-workflow-" });
+      const cwd = process.cwd();
+      const runPath = path.join(
+        home,
+        ".pi",
+        "workflows",
+        "projects",
+        piWorkflowProjectKey(cwd),
+        "runs",
+        "recon-run.json",
+      );
+      yield* fs.makeDirectory(path.dirname(runPath), { recursive: true });
+      yield* fs.writeFileString(
+        runPath,
+        JSON.stringify({
+          runId: "recon-run",
+          workflowName: "Adapter hardening",
+          status: "running",
+          phases: ["Recon", "Fix"],
+          currentPhase: "Recon",
+          agents: [
+            {
+              id: 1,
+              label: "recon-store",
+              phase: "Recon",
+              status: "running",
+              model: "local/opencode/deepseek:high",
+              tokens: 42,
+              startedAt: "2026-09-17T08:04:33.118Z",
+            },
+          ],
+          // The same delivery owner the fake `get_state` reports.
+          sessionId: "00000000-0000-4000-8000-000000000002",
+          startedAt: "2026-09-17T08:04:33.118Z",
+          updatedAt: "2026-09-17T08:05:33.118Z",
+        }),
+      );
+
+      const { runtime, takeEvent } = yield* openRuntime(
+        fake,
+        "default",
+        THREAD_ID,
+        SESSION_ID,
+        undefined,
+        {
+          storeRoot: path.join(home, ".pi", "workflows"),
+          sessionDir: path.join(home, ".pi", "agent", "sessions"),
+          intervalMs: 10,
+        },
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      // A real turn gives the sweep the run root it anchors workflow rows on;
+      // the synthetic fallback is only for a run seen without a turn.
+      yield* startTurn(runtime, providerThread);
+
+      yield* TestClock.adjust(Duration.millis(60));
+
+      const coordinator = yield* takeEvent(
+        (event) =>
+          event.type === "subagent.updated" && event.subagent.workflow?.kind === "workflow",
+      );
+      assert.isTrue(coordinator.type === "subagent.updated");
+      if (coordinator.type !== "subagent.updated") return;
+      assert.equal(coordinator.subagent.title, "Adapter hardening");
+      assert.equal(coordinator.subagent.workflow?.runId, "recon-run");
+      assert.deepEqual(coordinator.subagent.workflow?.phases, [
+        { index: 0, title: "Recon" },
+        { index: 1, title: "Fix" },
+      ]);
+      assert.equal(coordinator.subagent.parentNodeId, NodeId.make(`node:run:${THREAD_ID}:1:root`));
+
+      const member = yield* takeEvent(
+        (event) =>
+          event.type === "subagent.updated" && event.subagent.workflow?.kind === "workflow_agent",
+      );
+      assert.isTrue(member.type === "subagent.updated");
+      if (member.type !== "subagent.updated") return;
+      assert.equal(member.subagent.title, "recon-store");
+      assert.equal(member.subagent.workflow?.phaseTitle, "Recon");
+      assert.equal(member.subagent.parentNodeId, coordinator.subagent.id);
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 

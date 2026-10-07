@@ -31,6 +31,7 @@ import {
   ProviderDriverKind,
   type ChatAttachment,
   type ModelSelection,
+  type NodeId,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
@@ -54,6 +55,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -80,6 +82,10 @@ import {
 import { makeProviderFailure, makeProviderRetryTurnItem } from "../ProviderFailure.ts";
 import { turnScopedSelectionTransition } from "../ProviderSelectionTransition.ts";
 import {
+  defaultPiClaudeWorkflowSessionDir,
+  makePiClaudeWorkflowStore,
+} from "./PiClaudeWorkflowStore.ts";
+import {
   makePiRpcConnection,
   parsePiModelSlug,
   piRecordField as recordField,
@@ -88,6 +94,8 @@ import {
   type PiRpcConnection,
   type PiRpcRecord,
 } from "./PiRpc.ts";
+import { emptyPiWorkflowTracker, reconcilePiWorkflowRuns } from "./PiWorkflowProgress.ts";
+import { defaultPiWorkflowStoreRoot, makePiWorkflowStore } from "./PiWorkflowStore.ts";
 import {
   buildPiRpcLaunch,
   materializePiT3McpExtension,
@@ -228,6 +236,16 @@ export interface PiAdapterV2Options {
   readonly fileSystem: FileSystem.FileSystem;
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly serverConfig: ServerConfig.ServerConfig["Service"];
+  /**
+   * Root of the `@quintinshaw/pi-dynamic-workflows` run store. Absent disables
+   * the workflow sweep, which is how direct callers (tests) keep it off the
+   * operator's real store; the driver always supplies it.
+   */
+  readonly workflowStoreRoot?: string;
+  /** Pi session directory the `pi-workflows-claude` feed writes under. */
+  readonly workflowSessionDir?: string;
+  /** Cadence between workflow-store sweeps. Defaults to every three seconds. */
+  readonly workflowSweepIntervalMs?: number;
 }
 
 /** Concatenate the `text` fields of a Pi content-block array. */
@@ -364,6 +382,13 @@ function piApprovalRequestKind(title: string): "command" | "file-change" {
 interface PiThreadState {
   providerThread: OrchestrationV2ProviderThread;
   activeTurn: ActivePiTurn | null;
+  /**
+   * Root node of the most recent turn. The workflow sweep anchors a coordinator
+   * here so the bounded thread snapshot retains a finished workflow card while
+   * the turn that launched it is still inside the window. Null until the
+   * session's first turn, and the sweep falls back to a synthetic root then.
+   */
+  latestRootNodeId: NodeId | null;
 }
 
 // ── adapter ───────────────────────────────────────────────────
@@ -420,6 +445,20 @@ export function makePiAdapterV2(
         extensionPath,
         runtimeMode: input.runtimePolicy.runtimeMode,
       });
+      // Pi workflow extensions write their run state to disk, never over RPC.
+      // The sweep is enabled only when the driver resolved the store roots, so
+      // a direct caller leaves the operator's real store untouched.
+      const workflowStores =
+        options.workflowStoreRoot === undefined || options.workflowSessionDir === undefined
+          ? null
+          : {
+              snapshot: yield* makePiWorkflowStore({ homeDir: options.workflowStoreRoot }).pipe(
+                Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+              ),
+              feed: yield* makePiClaudeWorkflowStore({
+                sessionDir: options.workflowSessionDir,
+              }).pipe(Effect.provideService(FileSystem.FileSystem, options.fileSystem)),
+            };
       const connection: PiRpcConnection = yield* makePiRpcConnection({
         command: options.settings.binaryPath || "pi",
         args: launch.args,
@@ -472,6 +511,12 @@ export function makePiAdapterV2(
       let threadState: PiThreadState | null = null;
       let registrationAttempted = false;
       let lastNativeThreadId: string | null = null;
+      /**
+       * Delivery owner Pi reports as `get_state.sessionId`. The workflow
+       * stores attribute a run by this id, so an unknown id leaves every run
+       * invisible rather than guessed onto this thread.
+       */
+      let workflowSessionId: string | null = null;
       // User Stop intentionally tears down this RPC process after aborting.
       // Keep that intent beyond turn finalization so the later stdout close is
       // not mistaken for an unexpected transport failure.
@@ -526,6 +571,12 @@ export function makePiAdapterV2(
 
       const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
+
+      /** A later `get_state` (resume, rollback, fork) re-homes the delivery owner. */
+      const rememberWorkflowSessionId = (state: unknown): void => {
+        const sessionId = recordString(state, "sessionId")?.trim();
+        if (sessionId !== undefined && sessionId.length > 0) workflowSessionId = sessionId;
+      };
 
       const updateProviderSession = (
         status: OrchestrationV2ProviderSession["status"],
@@ -2027,6 +2078,7 @@ export function makePiAdapterV2(
           }
         }
         const stateData = yield* request({ type: "get_state" });
+        rememberWorkflowSessionId(stateData);
         if (!modelsDiscovered) {
           const modelsData = yield* request({ type: "get_available_models" }).pipe(
             Effect.orElseSucceed(() => undefined),
@@ -2093,7 +2145,7 @@ export function makePiAdapterV2(
                 createdAt,
                 updatedAt: createdAt,
               };
-        threadState = { providerThread, activeTurn: null };
+        threadState = { providerThread, activeTurn: null, latestRootNodeId: null };
         // Baseline the session-tree leaf so the first turn's user entry can
         // be located with a `since` cursor instead of a full entry scan.
         const baselineEntries = yield* request({ type: "get_entries" }).pipe(
@@ -2358,6 +2410,7 @@ export function makePiAdapterV2(
             // and answered instead of deadlocking the caller.
             yield* Effect.gen(function* () {
               state.activeTurn = activeTurn;
+              state.latestRootNodeId = turnInput.rootNodeId;
               if (compactCommand !== null) {
                 yield* connection.send(compactRpcRecord(compactCommand));
                 pendingCompactResponses.push({
@@ -2687,6 +2740,7 @@ export function makePiAdapterV2(
                 }),
               ),
             );
+            rememberWorkflowSessionId(forkState);
             const forkSessionFile = recordString(forkState, "sessionFile");
             if (forkSessionFile === undefined) {
               threadState = null;
@@ -2832,6 +2886,91 @@ export function makePiAdapterV2(
             ),
           ),
       };
+      // The stores are the only live source of workflow progress, so the
+      // session scope gets one spaced sweep. A failed sweep is logged and
+      // skipped with the tracker untouched: "I could not read this" must never
+      // reach a thread as "this ended".
+      if (workflowStores !== null) {
+        const configuredSweepIntervalMs = options.workflowSweepIntervalMs ?? 3_000;
+        const sweepInterval = Duration.millis(
+          Number.isFinite(configuredSweepIntervalMs) && configuredSweepIntervalMs >= 1
+            ? configuredSweepIntervalMs
+            : 3_000,
+        );
+        let tracker = emptyPiWorkflowTracker();
+        const sweep = Effect.gen(function* () {
+          const sessionId = workflowSessionId;
+          if (sessionId === null) return;
+          // Both stores are read before anything is concluded: a store that
+          // cannot be read at all leaves the round inconclusive and keeps the
+          // tracker, rather than reporting its runs as ended.
+          const [snapshotListing, feedListing] = yield* Effect.all(
+            [
+              workflowStores.snapshot.listRunsForSession({ cwd, sessionIds: [sessionId] }),
+              workflowStores.feed.listRunsForSession({ sessionIds: [sessionId] }),
+            ],
+            { concurrency: 2 },
+          );
+          const emittedAt = yield* DateTime.now;
+          const reconciled = reconcilePiWorkflowRuns({
+            runs: [...snapshotListing.runs, ...feedListing.runs],
+            unresolvedRunIds: [
+              ...snapshotListing.unresolvedRunIds,
+              ...feedListing.unresolvedRunIds,
+            ],
+            tracker,
+            context: {
+              threadId: input.threadId,
+              // A workflow outlives the turn that launched it and is attributed
+              // by Pi session, not by run, so it hangs at thread level. Its
+              // retention comes from the anchor node above, not from a run.
+              runId: null,
+              driver: PI_PROVIDER,
+              providerInstanceId: options.instanceId,
+              providerThreadId: threadState?.providerThread.id ?? null,
+              // Anchor a coordinator on the last turn's real root node so the
+              // windowed snapshot can retain a finished workflow card exactly
+              // as long as that turn is retained. The synthetic root is only a
+              // fallback for a run the sweep finds before any turn.
+              workflowRootNodeId:
+                threadState?.latestRootNodeId ??
+                idAllocator.derive.nodeFromProviderItem({
+                  driver: PI_PROVIDER,
+                  nativeItemId: `pi-workflow-root:${sessionId}`,
+                }),
+              nodeForRun: (runId) =>
+                idAllocator.derive.nodeFromProviderItem({
+                  driver: PI_PROVIDER,
+                  nativeItemId: `${runId}:workflow`,
+                }),
+              nodeForMember: (runId, agentId) =>
+                idAllocator.derive.nodeFromProviderItem({
+                  driver: PI_PROVIDER,
+                  nativeItemId: `${runId}:wf:${agentId}`,
+                }),
+              emittedAt,
+            },
+          });
+          tracker = reconciled.tracker;
+          for (const subagent of reconciled.subagents) {
+            yield* emit({ type: "subagent.updated", driver: PI_PROVIDER, subagent });
+          }
+        }).pipe(
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterrupts(cause),
+            (cause) =>
+              Effect.logDebug("Pi workflow sweep failed.", {
+                threadId: input.threadId,
+                cause,
+              }),
+          ),
+        );
+        yield* sweep.pipe(
+          Effect.repeat(Schedule.spaced(sweepInterval)),
+          Effect.forkIn(scope),
+          Effect.asVoid,
+        );
+      }
       return runtime;
     }),
   });
@@ -2971,14 +3110,21 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
       const fileSystem = yield* FileSystem.FileSystem;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const serverConfig = yield* ServerConfig.ServerConfig;
+      const environment = mergeProviderInstanceEnvironment(input.environment, hostEnvironment);
+      const resolvedLaunchArgs = resolvePiLaunchArgs(input.config.launchArgs);
       return makePiAdapterV2({
         instanceId: input.instanceId,
         settings: { ...input.config, enabled: input.enabled },
-        environment: mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+        environment,
         spawner,
         fileSystem,
         idAllocator,
         serverConfig,
+        workflowStoreRoot: defaultPiWorkflowStoreRoot(environment),
+        workflowSessionDir: defaultPiClaudeWorkflowSessionDir({
+          environment,
+          launchArgs: resolvedLaunchArgs.ok ? resolvedLaunchArgs.args : [],
+        }),
       });
     },
     (effect, input) =>
@@ -3005,6 +3151,7 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, PiAdapterV2Dr
       const fileSystem = yield* FileSystem.FileSystem;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const serverConfig = yield* ServerConfig.ServerConfig;
+      const resolvedLaunchArgs = resolvePiLaunchArgs(DEFAULT_PI_SETTINGS.launchArgs);
       return makePiAdapterV2({
         instanceId: PI_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_PI_SETTINGS,
@@ -3013,6 +3160,11 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, PiAdapterV2Dr
         fileSystem,
         idAllocator,
         serverConfig,
+        workflowStoreRoot: defaultPiWorkflowStoreRoot(hostEnvironment),
+        workflowSessionDir: defaultPiClaudeWorkflowSessionDir({
+          environment: hostEnvironment,
+          launchArgs: resolvedLaunchArgs.ok ? resolvedLaunchArgs.args : [],
+        }),
       });
     }),
   );

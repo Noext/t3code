@@ -820,6 +820,237 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       }),
   );
 
+  const createBoundedWorkflowThread = Effect.fn("createBoundedWorkflowThread")(function* (
+    threadId: ThreadId,
+  ) {
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    yield* projectionStore.apply({
+      id: EventId.make(`event:${threadId}:thread`),
+      type: "thread.created",
+      threadId,
+      occurredAt: now,
+      payload: {
+        createdBy: "user",
+        creationSource: "web",
+        id: threadId,
+        projectId: ProjectId.make(`project:${threadId}`),
+        title: "Bounded workflow",
+        providerInstanceId,
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      },
+    });
+  });
+
+  const seedBoundedWorkflowRun = Effect.fn("seedBoundedWorkflowRun")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly rootNodeId: NodeId;
+    readonly ordinal: number;
+  }) {
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    yield* projectionStore.apply({
+      id: EventId.make(`event:${input.runId}:run`),
+      type: "run.created",
+      threadId: input.threadId,
+      runId: input.runId,
+      occurredAt: now,
+      payload: {
+        id: input.runId,
+        threadId: input.threadId,
+        ordinal: input.ordinal,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make(`message:${input.runId}`),
+        rootNodeId: input.rootNodeId,
+        activeAttemptId: null,
+        status: "completed",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    });
+    yield* projectionStore.apply({
+      id: EventId.make(`event:${input.runId}:item`),
+      type: "turn-item.updated",
+      threadId: input.threadId,
+      runId: input.runId,
+      nodeId: input.rootNodeId,
+      driver,
+      occurredAt: now,
+      payload: {
+        id: TurnItemId.make(`item:${input.runId}`),
+        threadId: input.threadId,
+        runId: input.runId,
+        nodeId: input.rootNodeId,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: input.ordinal,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "command_execution",
+        input: "echo workflow",
+        output: "ok",
+        exitCode: 0,
+      },
+    });
+  });
+
+  const applyBoundedWorkflowSubagent = Effect.fn("applyBoundedWorkflowSubagent")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly id: NodeId;
+    readonly parentNodeId: NodeId;
+    readonly kind: "workflow" | "workflow_agent";
+  }) {
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    yield* projectionStore.apply({
+      id: EventId.make(`event:${input.id}:subagent`),
+      type: "subagent.updated",
+      threadId: input.threadId,
+      nodeId: input.id,
+      driver,
+      providerInstanceId,
+      occurredAt: now,
+      payload: {
+        id: input.id,
+        threadId: input.threadId,
+        // A workflow is attributed by provider session, never by an
+        // orchestration run: it can outlive the turn that launched it.
+        runId: null,
+        parentNodeId: input.parentNodeId,
+        origin: "provider_native",
+        createdBy: "agent",
+        driver,
+        providerInstanceId,
+        providerThreadId: null,
+        childThreadId: null,
+        nativeTaskRef: null,
+        prompt: "Bounded workflow",
+        title: "Bounded workflow",
+        model: null,
+        status: "completed",
+        result: null,
+        workflow: {
+          kind: input.kind,
+          workflowName: "Bounded workflow",
+          phases: input.kind === "workflow" ? [{ index: 0, title: "Recon" }] : [],
+          phaseIndex: input.kind === "workflow_agent" ? 0 : null,
+          phaseTitle: input.kind === "workflow_agent" ? "Recon" : null,
+          agentIndex: input.kind === "workflow_agent" ? 0 : null,
+          runId: "bounded-workflow-run",
+        },
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+      },
+    });
+  });
+
+  it.effect("retains a finished workflow coordinator and its members in the bounded snapshot", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:bounded-workflow-retained");
+      const runId = RunId.make("run:bounded-workflow-retained");
+      const rootNodeId = NodeId.make("node:bounded-workflow-retained:root");
+      const coordinatorId = NodeId.make("node:bounded-workflow-retained:coordinator");
+      const memberId = NodeId.make("node:bounded-workflow-retained:member");
+      yield* createBoundedWorkflowThread(threadId);
+      yield* seedBoundedWorkflowRun({ threadId, runId, rootNodeId, ordinal: 1 });
+      yield* applyBoundedWorkflowSubagent({
+        threadId,
+        id: coordinatorId,
+        parentNodeId: rootNodeId,
+        kind: "workflow",
+      });
+      yield* applyBoundedWorkflowSubagent({
+        threadId,
+        id: memberId,
+        parentNodeId: coordinatorId,
+        kind: "workflow_agent",
+      });
+
+      const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+        rowLimit: 10,
+      });
+      const retained = new Set(snapshot.projection.subagents.map((subagent) => subagent.id));
+      assert.isTrue(retained.has(coordinatorId));
+      assert.isTrue(retained.has(memberId));
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("drops a finished workflow whose anchor left the bounded snapshot", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:bounded-workflow-anchor-gone");
+      const olderRunId = RunId.make("run:bounded-workflow-anchor-gone:older");
+      const olderRootNodeId = NodeId.make("node:bounded-workflow-anchor-gone:older-root");
+      const olderCoordinatorId = NodeId.make("node:bounded-workflow-anchor-gone:older-coordinator");
+      const newerRunId = RunId.make("run:bounded-workflow-anchor-gone:newer");
+      const newerRootNodeId = NodeId.make("node:bounded-workflow-anchor-gone:newer-root");
+      const newerCoordinatorId = NodeId.make("node:bounded-workflow-anchor-gone:newer-coordinator");
+      yield* createBoundedWorkflowThread(threadId);
+      yield* seedBoundedWorkflowRun({
+        threadId,
+        runId: olderRunId,
+        rootNodeId: olderRootNodeId,
+        ordinal: 1,
+      });
+      yield* applyBoundedWorkflowSubagent({
+        threadId,
+        id: olderCoordinatorId,
+        parentNodeId: olderRootNodeId,
+        kind: "workflow",
+      });
+      yield* seedBoundedWorkflowRun({
+        threadId,
+        runId: newerRunId,
+        rootNodeId: newerRootNodeId,
+        ordinal: 2,
+      });
+      yield* applyBoundedWorkflowSubagent({
+        threadId,
+        id: newerCoordinatorId,
+        parentNodeId: newerRootNodeId,
+        kind: "workflow",
+      });
+
+      const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, { rowLimit: 1 });
+      const retained = new Set(snapshot.projection.subagents.map((subagent) => subagent.id));
+      assert.isTrue(retained.has(newerCoordinatorId));
+      assert.isFalse(retained.has(olderCoordinatorId));
+
+      // Both rows are real: only the window dropped the one whose anchor scrolled out.
+      const full = yield* projectionStore.getThreadSnapshot(threadId);
+      const all = new Set(full.projection.subagents.map((subagent) => subagent.id));
+      assert.isTrue(all.has(olderCoordinatorId));
+      assert.isTrue(all.has(newerCoordinatorId));
+    }).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("reads a fixed SQL turn-item window for long histories and repeated clients", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;

@@ -30,7 +30,10 @@ function rowTitle(subagent: Pick<OrchestrationV2Subagent, "title" | "prompt">): 
     : prompt;
 }
 
-function rowTone(status: OrchestrationV2Subagent["status"]): SubagentRowTone {
+/** Shared by the row and the workflow phase rail, which only has a status. */
+export function resolveSubagentStatusTone(
+  status: OrchestrationV2Subagent["status"],
+): SubagentRowTone {
   if (isActiveSubagentStatus(status)) return "working";
   if (status === "completed") return "completed";
   if (status === "failed") return "failed";
@@ -68,7 +71,7 @@ export function resolveSubagentRowPresentation(
     title: rowTitle(subagent),
     detail: subagentDetailPreview(subagent),
     statusLabel: rowStatusLabel(subagent.status),
-    tone: rowTone(subagent.status),
+    tone: resolveSubagentStatusTone(subagent.status),
     live,
     canOpenThread: subagent.childThreadId !== null,
   };

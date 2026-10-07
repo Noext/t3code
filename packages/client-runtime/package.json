@@ -275,6 +275,10 @@
       "types": "./src/state/subagentRuntime.ts",
       "default": "./src/state/subagentRuntime.ts"
     },
+    "./state/workflow-groups": {
+      "types": "./src/state/workflowGroups.ts",
+      "default": "./src/state/workflowGroups.ts"
+    },
     "./state/thread-sort": {
       "types": "./src/state/threadSort.ts",
       "default": "./src/state/threadSort.ts"

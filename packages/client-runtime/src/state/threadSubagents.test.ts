@@ -99,6 +99,36 @@ describe("deriveThreadTurnSubagents", () => {
     expect(turn?.settledCount).toBe(1);
     expect(turn?.subagents).toHaveLength(3);
   });
+
+  it("ignores workflow rows, which carry no run id", () => {
+    const turn = deriveThreadTurnSubagents({
+      runs: [finishedRun],
+      subagents: [
+        subagent({ id: "a", status: "completed" }),
+        // The workflow sweep updates these rows on a heartbeat, so the newest
+        // row in the thread is often the one with no run id.
+        subagent({
+          id: "wf",
+          runId: null,
+          status: "running",
+          updatedAt: at("2026-06-20T00:00:09.000Z"),
+        }),
+      ],
+    });
+
+    // The workflow row must not hijack the settled turn's roster.
+    expect(turn?.runId).toBe("run-1");
+    expect(turn?.subagents.map((entry) => entry.id)).toEqual(["a"]);
+  });
+
+  it("returns null when the thread only ever ran a workflow", () => {
+    expect(
+      deriveThreadTurnSubagents({
+        runs: [finishedRun],
+        subagents: [subagent({ id: "wf", runId: null, status: "completed" })],
+      }),
+    ).toBeNull();
+  });
 });
 
 describe("resolveSubagentPillSegment", () => {

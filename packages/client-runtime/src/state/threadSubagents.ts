@@ -6,6 +6,11 @@
  * subagent it ever spawned, while the pill and its sheet answer "what is this
  * turn doing right now". Statuses come from the v2 projection directly, so
  * this stays a pure fold over `runs` and `subagents`.
+ *
+ * Workflow rows are excluded: a provider workflow coordinator and its members
+ * carry `runId: null` (a run outlives the turn that launched it), so the
+ * settled-turn fallback below would otherwise adopt every workflow row as "the
+ * turn". Workflows render on their own card, not in this roster.
  */
 import * as DateTime from "effect/DateTime";
 import type { OrchestrationV2Subagent, OrchestrationV2ThreadProjection } from "@t3tools/contracts";
@@ -37,22 +42,23 @@ function orderKey(subagent: Subagent): number {
   return DateTime.toEpochMillis(subagent.startedAt ?? subagent.updatedAt);
 }
 
-/** null when the thread has never spawned a subagent. */
+/** null when the thread has never spawned a turn subagent. */
 export function deriveThreadTurnSubagents(
   projection: Pick<Projection, "runs" | "subagents">,
 ): ThreadTurnSubagents | null {
-  if (projection.subagents.length === 0) return null;
+  const roster = projection.subagents.filter((subagent) => subagent.runId !== null);
+  if (roster.length === 0) return null;
   const activeRun = resolveActiveThreadRun(projection);
   // With no live run the newest roster is still worth showing: a turn that
   // just finished leaves results the user has not read yet.
-  const latestUpdated = projection.subagents.reduce((latest, subagent) =>
+  const latestUpdated = roster.reduce((latest, subagent) =>
     DateTime.toEpochMillis(subagent.updatedAt) > DateTime.toEpochMillis(latest.updatedAt)
       ? subagent
       : latest,
   );
   const runId = activeRun?.id ?? latestUpdated.runId;
   const subagents = copySorted(
-    projection.subagents.filter((subagent) => subagent.runId === runId),
+    roster.filter((subagent) => subagent.runId === runId),
     (left, right) => orderKey(left) - orderKey(right) || left.id.localeCompare(right.id),
   );
   if (subagents.length === 0) return null;

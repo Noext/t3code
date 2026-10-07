@@ -93,7 +93,11 @@ export function isActiveSubagentStatus(status: RuntimeSubagentStatus): boolean {
 
 /**
  * Projects orchestration-v2 subagent entities into the runtime shape the web
- * agent rows render.
+ * and mobile agent rows render. A subagent carrying the provider-workflow
+ * block keeps its workflow identity: the coordinator becomes `kind: "workflow"`,
+ * each member `kind: "workflow_agent"` linked back through `parentNodeId`, and
+ * the run's engine id lands in `runHandles.runId` for the card's run suffix.
+ * Everything else projects exactly as before.
  */
 export function projectedSubagentsToRuntime(
   subagents: ReadonlyArray<{
@@ -104,6 +108,8 @@ export function projectedSubagentsToRuntime(
     readonly status: OrchestrationV2Subagent["status"];
     readonly progress?: string | undefined;
     readonly result: string | null;
+    readonly parentNodeId?: string | undefined;
+    readonly workflow?: OrchestrationV2Subagent["workflow"];
     readonly startedAt: DateTime.Utc | null;
     readonly completedAt: DateTime.Utc | null;
     readonly updatedAt: DateTime.Utc;
@@ -112,9 +118,10 @@ export function projectedSubagentsToRuntime(
   return subagents.map((subagent) => {
     const updatedAt = DateTime.formatIso(subagent.updatedAt);
     const startedAt = subagent.startedAt === null ? null : DateTime.formatIso(subagent.startedAt);
+    const workflow = subagent.workflow;
     return {
       id: subagent.id,
-      kind: "subagent" as const,
+      kind: workflow?.kind ?? "subagent",
       title:
         subagent.title ??
         (subagent.prompt.length > 80 ? `${subagent.prompt.slice(0, 77)}...` : subagent.prompt),
@@ -129,14 +136,16 @@ export function projectedSubagentsToRuntime(
       result: subagent.result,
       error: subagent.status === "failed" ? (subagent.result ?? null) : null,
       outputFile: null,
-      parentAgentId: null,
-      agentIndex: null,
-      phaseIndex: null,
-      phaseTitle: null,
+      // A workflow member hangs off its coordinator node; a coordinator and a
+      // plain subagent have no agent parent.
+      parentAgentId: workflow?.kind === "workflow_agent" ? (subagent.parentNodeId ?? null) : null,
+      agentIndex: workflow?.agentIndex ?? null,
+      phaseIndex: workflow?.phaseIndex ?? null,
+      phaseTitle: workflow?.phaseTitle ?? null,
       attempt: null,
-      workflowName: null,
-      phases: [],
-      runHandles: null,
+      workflowName: workflow?.workflowName ?? null,
+      phases: workflow?.phases ?? [],
+      runHandles: workflow?.runId == null ? null : { runId: workflow.runId },
       recentActivity: [],
       firstSeenAt: startedAt ?? updatedAt,
       startedAt,

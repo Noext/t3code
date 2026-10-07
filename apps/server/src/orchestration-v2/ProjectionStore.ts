@@ -2932,11 +2932,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `
               : sql<PayloadRow>`
+            WITH RECURSIVE retained_subagents(subagent_id) AS (
+              SELECT subagent_id FROM orchestration_v2_projection_subagents
+              WHERE thread_id = ${threadId}
+                AND (status IN ('pending','starting','running','waiting')
+                  OR run_id IN (SELECT value FROM json_each(${cohortRunIds}))
+                  OR parent_node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
+              UNION
+              SELECT child.subagent_id FROM orchestration_v2_projection_subagents AS child
+              INNER JOIN retained_subagents AS parent
+                ON child.parent_node_id = parent.subagent_id
+              WHERE child.thread_id = ${threadId}
+            )
             SELECT payload_json FROM orchestration_v2_projection_subagents
             WHERE thread_id = ${threadId}
-              AND (status IN ('pending','starting','running','waiting')
-                OR run_id IN (SELECT value FROM json_each(${cohortRunIds}))
-                OR parent_node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
+              AND subagent_id IN (SELECT subagent_id FROM retained_subagents)
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `,
           fields !== undefined && !fields.includes("providerSessions")

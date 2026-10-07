@@ -4,9 +4,13 @@ import {
 } from "@t3tools/client-runtime/state/shell";
 import {
   EnvironmentId,
+  NodeId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  RunId,
   ThreadId,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -69,4 +73,34 @@ export function makeThreadShellFixture(
     worktreePath: overrides.worktreePath,
   });
   return { ...presentThreadShell(environmentId, raw), ...overrides };
+}
+
+/** A provider-native subagent, plain by default; workflow fields go in `workflow`. */
+export function makeRawSubagent(
+  input: Partial<OrchestrationV2Subagent> & { readonly id: NodeId },
+): OrchestrationV2Subagent {
+  const { id, ...overrides } = input;
+  const now = DateTime.makeUnsafe(DEFAULT_TIMESTAMP);
+  return {
+    id,
+    threadId: ThreadId.make("thread-test"),
+    runId: RunId.make("run-test"),
+    parentNodeId: NodeId.make("node-root"),
+    origin: "provider_native",
+    createdBy: "agent",
+    driver: ProviderDriverKind.make("pi"),
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    providerThreadId: null,
+    childThreadId: null,
+    nativeTaskRef: null,
+    prompt: "Do the thing",
+    title: "Worker",
+    model: "claude-sonnet-5",
+    status: "running",
+    result: null,
+    startedAt: now,
+    completedAt: null,
+    updatedAt: now,
+    ...overrides,
+  };
 }

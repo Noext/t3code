@@ -36,6 +36,7 @@ import {
   OrchestrationV2ShellSnapshot,
   OrchestrationV2SubscribeThreadInput,
   OrchestrationV2Subagent,
+  OrchestrationV2SubagentJson,
   OrchestrationV2ThreadHistoryPage,
   OrchestrationV2ThreadProjection,
   OrchestrationV2ThreadStreamItem,
@@ -844,6 +845,66 @@ describe("orchestration V2 contracts", () => {
     expect(turnItem.type).toBe("subagent");
     if (turnItem.type !== "subagent") throw new Error("expected subagent item");
     expect(turnItem.progress).toBe("Inspecting package metadata");
+  });
+
+  it("decodes and round-trips a workflow subagent's optional workflow block", () => {
+    const workflowSubagent = decodeOrchestrationV2Subagent({
+      id: "node-workflow-1",
+      threadId: "thread-1",
+      runId: null,
+      parentNodeId: "node-workflow-parent-1",
+      origin: "provider_native",
+      createdBy: "agent",
+      driver: "pi",
+      providerInstanceId: "pi",
+      providerThreadId: "provider-thread-workflow-1",
+      childThreadId: null,
+      nativeTaskRef: {
+        driver: "pi",
+        nativeId: "workflow:run-1",
+        strength: "strong",
+      },
+      prompt: "Adapter hardening",
+      title: "Adapter hardening",
+      model: null,
+      status: "running",
+      result: null,
+      workflow: {
+        kind: "workflow",
+        workflowName: "Adapter hardening",
+        phases: [
+          { index: 0, title: "Recon" },
+          { index: 1, title: "Fix" },
+        ],
+        phaseIndex: null,
+        phaseTitle: null,
+        agentIndex: null,
+        runId: "run-1",
+      },
+      startedAt: now,
+      completedAt: null,
+      updatedAt: now,
+    });
+
+    expect(workflowSubagent.workflow?.kind).toBe("workflow");
+    expect(workflowSubagent.workflow?.phases).toEqual([
+      { index: 0, title: "Recon" },
+      { index: 1, title: "Fix" },
+    ]);
+
+    // The JSON codec is derived from the struct: the block survives a
+    // persistence round-trip with the dates stringified.
+    const codec = Schema.encodeSync(Schema.fromJsonString(OrchestrationV2SubagentJson));
+    const encoded = codec(workflowSubagent);
+    const decoded = Schema.decodeSync(Schema.fromJsonString(OrchestrationV2SubagentJson))(encoded);
+    expect(decoded.workflow).toEqual(workflowSubagent.workflow);
+
+    // A subagent without the block still decodes (legacy rows), and re-encoding
+    // it keeps the key absent instead of writing `workflow: undefined`.
+    const { workflow: _workflow, ...withoutWorkflowInput } = workflowSubagent;
+    const withoutWorkflow = decodeOrchestrationV2Subagent(withoutWorkflowInput);
+    expect(withoutWorkflow.workflow).toBeUndefined();
+    expect(JSON.parse(codec(withoutWorkflow))).not.toHaveProperty("workflow");
   });
 
   it("decodes app-owned subagent parent-wake policies", () => {
