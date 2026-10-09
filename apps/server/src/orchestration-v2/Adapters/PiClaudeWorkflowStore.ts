@@ -34,8 +34,8 @@
  *
  * @module orchestration-v2/Adapters/PiClaudeWorkflowStore
  */
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -400,8 +400,8 @@ export function defaultPiClaudeWorkflowSessionDir(input: {
     }
   }
   const configuredHome = input.environment?.HOME?.trim();
-  return join(
-    configuredHome && configuredHome.length > 0 ? configuredHome : homedir(),
+  return NodePath.join(
+    configuredHome && configuredHome.length > 0 ? configuredHome : NodeOS.homedir(),
     ".pi",
     "agent",
     "sessions",
@@ -549,8 +549,10 @@ export const makePiClaudeWorkflowStore = Effect.fn("makePiClaudeWorkflowStore")(
   const listRunsForSession: PiClaudeWorkflowStoreShape["listRunsForSession"] = (input) =>
     semaphore.withPermit(
       Effect.gen(function* () {
-        const feedsDir = join(
-          input.sessionFile === undefined ? options.sessionDir : dirname(input.sessionFile),
+        const feedsDir = NodePath.join(
+          input.sessionFile === undefined
+            ? options.sessionDir
+            : NodePath.dirname(input.sessionFile),
           "workflows",
         );
         // An absent directory means the extension never ran for this instance.
@@ -575,7 +577,7 @@ export const makePiClaudeWorkflowStore = Effect.fn("makePiClaudeWorkflowStore")(
         }> = [];
         for (const fileName of entries.value) {
           if (!fileName.endsWith(FEED_SUFFIX)) continue;
-          const filePath = join(feedsDir, fileName);
+          const filePath = NodePath.join(feedsDir, fileName);
           const info = yield* statFeedFile(filePath);
           if (info === null) {
             // Listed but unreadable: it exists, so it must not read as gone.
