@@ -24,7 +24,7 @@ concurrency:
 jobs:
   fingerprint:
     name: Native fingerprint diff
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: [self-hosted, linux, x64, t3code-ci]
     permissions:
       contents: read
       issues: write
