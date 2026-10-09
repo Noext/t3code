@@ -1417,6 +1417,7 @@ export const make = Effect.gen(function* () {
         const refsResponse = yield* api.rest({
           host: input.host,
           operation: "getPullRequestDiffFileContents",
+          account: owner,
           path:
             input.commit === undefined
               ? `repos/${owner}/${name}/pulls/${input.number}`
@@ -2476,6 +2477,7 @@ export const make = Effect.gen(function* () {
           .rest({
             host: input.host,
             operation: "setLabels",
+            account: owner,
             method: "POST",
             path: issue,
             body: buildLabelRequest(input.labels),
@@ -2488,6 +2490,7 @@ export const make = Effect.gen(function* () {
           api.rest({
             host: input.host,
             operation: "setLabels",
+            account: owner,
             method: "DELETE",
             path: `${issue}/${encodeURIComponent(label)}`,
           }),

@@ -51,6 +51,7 @@ import * as CheckpointStore from "./checkpointing/CheckpointStore.ts";
 import * as AzureDevOpsCli from "./sourceControl/AzureDevOpsCli.ts";
 import * as BitbucketApi from "./sourceControl/BitbucketApi.ts";
 import * as GitHubCli from "./sourceControl/GitHubCli.ts";
+import * as GitHubCredentials from "./sourceControl/GitHubCredentials.ts";
 import * as GitLabCli from "./sourceControl/GitLabCli.ts";
 import * as ForgejoCli from "./sourceControl/ForgejoCli.ts";
 import * as TextGeneration from "./textGeneration/TextGeneration.ts";
@@ -1053,6 +1054,11 @@ const layerMakeServer = Layer.unwrap(
     );
 
     return layerServerApplication.pipe(
+      // Git commands run as the account that owns the remote they address, so the git driver needs
+      // the credentials service that knows every signed-in account. Provided here rather than in the
+      // driver's own layer: this is where the process limiter, Settings and the platform services
+      // the credential lookup needs are already in scope.
+      Layer.provide(GitHubCredentials.layer),
       // The connect routes and the startup/shutdown link work share one instance.
       Layer.provide(CloudLink.layer),
       Layer.provideMerge(layerRuntimeServices),

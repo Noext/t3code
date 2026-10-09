@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Redacted from "effect/Redacted";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
 import { HostProcessEnvironment, HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
@@ -86,17 +87,43 @@ export const isGitHubCredentialUnavailableError = Schema.is(
 );
 
 /**
- * Where GitHub tokens come from. Callers ask per host and never see how the token was found,
- * so another source (an in-app OAuth login) slots in here without touching any of them.
+ * What a caller knows about the repository its work concerns. Nothing here changes where a token
+ * may come from: Settings and the environment still speak first, because both are choices the user
+ * made about the host itself.
+ */
+export interface GitHubCredentialRequest {
+  /**
+   * The owner of the repository the credential is for. `gh` is asked for that login before the
+   * Settings choice, which is how a repository owned by a second signed-in account stays readable
+   * while another account is active. An owner that is not a login — an organization — and one `gh`
+   * no longer holds both fall back to the Settings choice and then to `gh`'s active login, so
+   * naming an owner can only ever add a source, never remove one.
+   */
+  readonly account?: string | undefined;
+  /**
+   * Whether only that owner's own login may answer. Git asks for this: its credential helper already
+   * answers as the active account, so naming that account explicitly would replace whatever else the
+   * machine is configured with, and a repository owned by an organization is better left to the
+   * helper. The default also accepts the Settings choice and the active login, which is what an API
+   * request needs to authenticate at all.
+   */
+  readonly ownerOnly?: boolean;
+}
+
+/**
+ * Where GitHub tokens come from. Callers ask per host, and may name the owner of the repository they
+ * are about; they never see how the token was found, so another source (an in-app OAuth login)
+ * slots in here without touching any of them.
  */
 export class GitHubCredentials extends Context.Service<
   GitHubCredentials,
   {
     readonly get: (
       host: string,
+      request?: GitHubCredentialRequest,
     ) => Effect.Effect<GitHubCredential, GitHubCredentialUnavailableError>;
     /** Drops the held token after GitHub refused it, so the next read asks its source again. */
-    readonly invalidate: (host: string) => Effect.Effect<void>;
+    readonly invalidate: (host: string, request?: GitHubCredentialRequest) => Effect.Effect<void>;
   }
 >()("t3/sourceControl/GitHubCredentials") {}
 
@@ -105,7 +132,7 @@ function normalizeHost(host: string): string {
 }
 
 /** Hosts gh treats as GitHub.com-like for `GH_TOKEN`: github.com and GHE.com data residency. */
-function isGitHubDotCom(host: string): boolean {
+export function isGitHubDotCom(host: string): boolean {
   return host === "github.com" || host.endsWith(".ghe.com");
 }
 
@@ -195,23 +222,53 @@ export const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => null),
     );
 
-  /** Cache key: the host plus its pinned account, so a changed pin misses the cache. */
-  const cacheKey = (host: string, account: string | undefined) =>
-    account === undefined ? host : `${host}\u0000${account}`;
+  /**
+   * Cache key: the host, the login asked for and whether only that login may answer, so two logins of
+   * one host — and the same login asked for strictly and loosely — never share an entry.
+   */
+  const cacheKey = (host: string, account: string | undefined, ownerOnly: boolean) =>
+    `${host}\u0000${account ?? ""}\u0000${ownerOnly ? "owner" : "any"}`;
+
+  /** A blank account is no account: it may not reach the cache key or `gh --user`. */
+  const normalizeAccount = (account: string | undefined): string | undefined => {
+    const trimmed = account?.trim();
+    return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed;
+  };
+
+  /**
+   * A token from the first login `gh` holds one for, in the order the caller ranked them. A login `gh`
+   * no longer holds is a reason to try the next one, not to fail: an owner is often an organization
+   * rather than a login. A trailing `undefined` asks for `gh`'s active login, and the caller that put
+   * it there is the one that decided a guess is better than no answer.
+   */
+  const tokenFor = (host: string, attempts: ReadonlyArray<string | undefined>) =>
+    Effect.gen(function* () {
+      const candidates = [
+        ...new Set(attempts.filter((account) => account === undefined || account.length > 0)),
+      ];
+      let refusal: GitHubCredentialUnavailableError | null = null;
+      for (const account of candidates) {
+        const attempt = yield* fromGh(host, account).pipe(Effect.result);
+        if (Result.isSuccess(attempt)) return attempt.success;
+        refusal ??= attempt.failure;
+      }
+      // Every login was refused, so the first refusal is reported: it names the account asked for.
+      return yield* Effect.fail(refusal!);
+    });
 
   const lookup = Effect.fn("GitHubCredentials.lookup")(function* (key: string) {
-    const [host = key, choice] = key.split("\u0000");
-    // An environment token wins over a pinned account, exactly as it does in gh.
+    const [host = key, account, mode] = key.split("\u0000");
+    // An environment token wins over a login, exactly as it does in gh.
     const fromEnv = environmentToken(host, environment);
-    // A pinned login gh no longer holds (logged out, expired) falls back to the active one,
-    // which is what discovery reports as the account in use.
+    // The owner the caller named comes first, then the login Settings pins. `gh`'s active login is
+    // the fallback for both, because an owner is often an organization rather than a login — unless
+    // the caller asked for the owner's own login, which is a caller that must not replace whatever
+    // authentication the machine already had.
     const token =
       fromEnv ??
-      (yield* fromGh(host, choice).pipe(
-        Effect.catchTags({
-          GitHubNotSignedInError: (error) =>
-            choice === undefined ? Effect.fail(error) : fromGh(host, undefined),
-        }),
+      (yield* tokenFor(
+        host,
+        mode === "owner" ? [account] : [account, (yield* hostChoice(host))?.account, undefined],
       ));
     return {
       host,
@@ -235,7 +292,7 @@ export const make = Effect.gen(function* () {
   });
 
   return GitHubCredentials.of({
-    get: Effect.fn("GitHubCredentials.get")(function* (rawHost) {
+    get: Effect.fn("GitHubCredentials.get")(function* (rawHost, request) {
       const host = normalizeHost(rawHost);
       const choice = yield* hostChoice(host);
       if (choice?.enabled === false) {
@@ -252,14 +309,26 @@ export const make = Effect.gen(function* () {
           fingerprint: yield* fingerprintOf(host, saved),
         } satisfies GitHubCredential;
       }
-      return yield* Cache.get(cache, cacheKey(host, choice?.account));
-    }),
-    invalidate: (rawHost) => {
-      const host = normalizeHost(rawHost);
-      return hostChoice(host).pipe(
-        Effect.flatMap((choice) => Cache.invalidate(cache, cacheKey(host, choice?.account))),
+      // The owner the caller named is more specific than the host's pin, so it is the cache key and
+      // `lookup` ranks the pin behind it.
+      return yield* Cache.get(
+        cache,
+        cacheKey(host, normalizeAccount(request?.account) ?? choice?.account, request?.ownerOnly === true),
       );
-    },
+    }),
+    invalidate: (rawHost, request) =>
+      Effect.gen(function* () {
+        const host = normalizeHost(rawHost);
+        const choice = yield* hostChoice(host);
+        yield* Cache.invalidate(
+          cache,
+          cacheKey(
+            host,
+            normalizeAccount(request?.account) ?? choice?.account,
+            request?.ownerOnly === true,
+          ),
+        );
+      }),
   });
 });
 

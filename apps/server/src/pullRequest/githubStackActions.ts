@@ -144,12 +144,15 @@ export const runGitHubStackAction = Effect.fn("runGitHubStackAction")(function* 
     number: input.number,
     stackNumber: input.stackNumber,
   };
+  // Every request below names a repository, so each one authenticates as the account that owns it.
+  const [owner = "", name = ""] = input.repository.split("/");
   if (input.action !== "merge" && input.action !== "update-branch")
     return yield* new GitHubStackUnsupportedError({ ...identity });
   const endpoint = `repos/${input.repository}`;
   const read = yield* api.rest({
     host: input.host,
     operation: "runGitHubStackAction",
+    account: owner,
     path: `${endpoint}/stacks?pull_request=${input.number}`,
   });
   const decoded = decodePullRequestStacksJson(read.body);
@@ -187,10 +190,10 @@ export const runGitHubStackAction = Effect.fn("runGitHubStackAction")(function* 
   if (open.length === 0 || open.some((layer) => layer.state !== "open"))
     return yield* new GitHubStackUnsupportedError({ ...identity });
   if (input.action === "update-branch") {
-    const [owner, name] = input.repository.split("/");
     const permissions = yield* api.graphql({
       host: input.host,
       operation: "runGitHubStackAction",
+      account: owner,
       allowReserve: true,
       variables: { owner, name },
       query: `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${open
@@ -251,6 +254,7 @@ export const runGitHubStackAction = Effect.fn("runGitHubStackAction")(function* 
   const request = yield* api.rest({
     host: input.host,
     operation: "runGitHubStackAction",
+    account: owner,
     method: "PUT",
     path: `${endpoint}/pulls/${input.number}/merge-async`,
     body: {
@@ -272,6 +276,7 @@ export const runGitHubStackAction = Effect.fn("runGitHubStackAction")(function* 
     const poll = yield* api.rest({
       host: input.host,
       operation: "runGitHubStackAction",
+      account: owner,
       path: `${endpoint}/pulls/${input.number}/merge-async/${encodeURIComponent(uuid)}`,
     });
     result = yield* decode(poll.body);

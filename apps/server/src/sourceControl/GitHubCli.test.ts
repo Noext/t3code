@@ -105,6 +105,40 @@ function harness(input: {
   return { layer, git };
 }
 
+describe("GitHubCli repository lookups", () => {
+  it.effect("reads a repository as the account that owns it", () => {
+    const calls: Array<GitHubApi.GitHubRestInput> = [];
+    const { layer } = harness({
+      remotes: "",
+      api: {
+        rest: (input) =>
+          Effect.sync(() => {
+            calls.push(input);
+            return restResponse({
+              full_name: "noext/tire-price-checker-v3",
+              html_url: "https://github.com/noext/tire-price-checker-v3",
+              ssh_url: "git@github.com:noext/tire-price-checker-v3.git",
+            });
+          }),
+      },
+    });
+    return Effect.gen(function* () {
+      const cli = yield* GitHubCli.GitHubCli;
+      const urls = yield* cli.getRepositoryCloneUrls({
+        cwd: "/tmp/checkout",
+        repository: "noext/tire-price-checker-v3",
+      });
+      assert.strictEqual(urls.nameWithOwner, "noext/tire-price-checker-v3");
+      // The owner travels with the request, so a second signed-in account can read it.
+      assert.deepStrictEqual(
+        calls.map((call) => call.account),
+        ["noext"],
+      );
+      assert.strictEqual(calls[0]?.path, "repos/noext/tire-price-checker-v3");
+    }).pipe(Effect.provide(layer));
+  });
+});
+
 describe("selectGitHubBaseRepository", () => {
   const remotes = (...entries: ReadonlyArray<readonly [string, string]>) =>
     entries
