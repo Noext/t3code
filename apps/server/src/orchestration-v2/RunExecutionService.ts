@@ -1279,10 +1279,11 @@ export const layer: Layer.Layer<
             Effect.catchCause((cause) =>
               Ref.get(rootRunFinalized).pipe(
                 Effect.flatMap((finalized) =>
-                  Effect.logWarning("orchestration V2 provider event ingestion failed", {
+                  Effect.logError("orchestration V2 provider event ingestion failed", {
                     runId: input.run.id,
-                    cause,
+                    cause: Cause.pretty(cause),
                   }).pipe(
+                    Effect.withSpan("orchestrationV2.runIngestFailure"),
                     Effect.andThen(
                       finalized
                         ? Effect.void
@@ -1392,8 +1393,9 @@ export const layer: Layer.Layer<
             Effect.catchCause((cause) =>
               Effect.logError("orchestration V2 provider turn start failed", {
                 runId: input.run.id,
-                cause,
+                cause: Cause.pretty(cause),
               }).pipe(
+                Effect.withSpan("orchestrationV2.providerTurnStartFailure"),
                 Effect.andThen(Fiber.interrupt(providerEventFiber)),
                 Effect.andThen(Ref.get(latestProviderThread)),
                 Effect.flatMap((providerThread) =>

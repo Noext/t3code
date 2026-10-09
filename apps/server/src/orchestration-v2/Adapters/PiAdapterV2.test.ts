@@ -644,6 +644,74 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("finalizes an orphaned turn when a later run resumes the thread", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      // Run 1 starts a turn whose run then dies elsewhere (no prompt ack, no
+      // terminal event): the adapter still holds an active turn for it.
+      yield* startTurn(runtime, providerThread, "default", [], "Hello pi", undefined, 1);
+      yield* fake.takeRequest("prompt");
+      const orphaned = yield* takeEvent(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      const orphanedProviderTurnId =
+        orphaned.type === "provider_turn.updated" ? orphaned.providerTurn.id : undefined;
+
+      // Run 2 resumes the same thread: the orphan is finalized, not rejected.
+      const resumed = yield* runtime.resumeThread({
+        providerThread,
+        runId: RunId.make(`run:${THREAD_ID}:2`),
+      });
+      assert.equal(resumed.id, providerThread.id);
+      const finalized = yield* takeEvent(
+        (event) => event.type === "provider_turn.updated" && event.providerTurn.status === "failed",
+      );
+      assert.equal(
+        finalized.type === "provider_turn.updated" ? finalized.providerTurn.id : undefined,
+        orphanedProviderTurnId,
+      );
+      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.equal(terminal.type === "turn.terminal" ? terminal.status : undefined, "failed");
+
+      // The next run starts on the same session instead of being rejected.
+      yield* startTurn(runtime, providerThread, "default", [], "Second", undefined, 2);
+      const nextPrompt = yield* fake.takeRequest("prompt");
+      assert.equal(nextPrompt["message"], "Second");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("still rejects a second turn that belongs to the active run", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread, "default", [], "Hello pi", undefined, 1);
+      yield* fake.takeRequest("prompt");
+      const error = yield* startTurn(
+        runtime,
+        providerThread,
+        "default",
+        [],
+        "Again",
+        undefined,
+        1,
+      ).pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterTurnStartError");
+      assert.match(String(error.cause), /already has an active turn/);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("waits for a slow Pi resume without starting a replacement", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
