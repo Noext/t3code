@@ -654,6 +654,7 @@ export const layer: Layer.Layer<
               runtimePolicy: resolvedRuntimePolicy,
               providerSessionId,
               existingProviderThread: providerThread,
+              runId,
             }),
           );
         }
@@ -679,6 +680,7 @@ export const layer: Layer.Layer<
                 threadId: projection.thread.id,
                 modelSelection: run.modelSelection,
                 runtimePolicy: resolvedRuntimePolicy,
+                runId,
               }),
         );
         if (resumed._tag === "Success") {
@@ -702,6 +704,7 @@ export const layer: Layer.Layer<
             // session instead of retrying the resume that just failed, while
             // still adopting this row's identity.
             existingProviderThread: { ...providerThread, nativeThreadRef: null },
+            runId,
           }),
         );
         if (replacement === undefined) return undefined;

@@ -391,6 +391,11 @@ export interface ProviderAdapterV2EnsureThreadInput {
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
   readonly providerSessionId?: ProviderSessionId;
   readonly existingProviderThread?: OrchestrationV2ProviderThread;
+  /**
+   * Run that is binding (or rebinding) this thread. Adapters use it to tell a
+   * live turn from one orphaned by an earlier, already-terminal run.
+   */
+  readonly runId?: RunId;
 }
 
 export interface ProviderAdapterV2TurnInput {
@@ -531,6 +536,8 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly threadId?: ThreadId;
     readonly modelSelection?: ModelSelection;
     readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
+    /** Run that is binding (or rebinding) this thread; see ensureThread. */
+    readonly runId?: RunId;
   }) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
   /** False means the native protocol explicitly does not support history injection. */
   readonly injectHistory?: (

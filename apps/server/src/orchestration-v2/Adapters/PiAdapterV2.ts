@@ -46,6 +46,7 @@ import {
   type ProviderApprovalDecision,
   type ProviderInstanceId,
   type OrchestrationV2ProviderTurnTokenUsage,
+  type RunId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -1577,6 +1578,60 @@ export function makePiAdapterV2(
         }
       });
 
+      /**
+       * A new orchestration run only starts once the previous run of the same
+       * thread reached a terminal state, so an `activeTurn` that belongs to a
+       * different run can never make progress: its prompt ack or dialog answer
+       * never arrived, and its run is already gone. Nothing else clears that
+       * state — orchestration only aborts a provider turn on an explicit Stop —
+       * so rejecting every later turn would brick the thread until the provider
+       * session is recreated. Finalize the orphan instead and let the incoming
+       * run proceed.
+       *
+       * Returns false when the live turn belongs to the incoming run (a real
+       * "already active" conflict) or when the caller did not tell us its run.
+       */
+      const discardOrphanedTurn = Effect.fnUntraced(function* (
+        state: PiThreadState,
+        incomingRunId: RunId | undefined,
+        operation: "registerThread" | "startTurn",
+      ) {
+        const orphan = state.activeTurn;
+        if (orphan === null) return true;
+        if (incomingRunId === undefined || orphan.turnInput.runId === incomingRunId) return false;
+        const orphanedRunId = orphan.turnInput.runId;
+        const orphanedProviderTurnId = orphan.providerTurn.id;
+        yield* Effect.logWarning("Discarded an orphaned Pi turn before starting the next one.", {
+          operation,
+          providerThreadId: state.providerThread.id,
+          orphanedRunId,
+          orphanedProviderTurnId,
+          incomingRunId,
+        }).pipe(Effect.withSpan("PiAdapterV2.discardOrphanedTurn"));
+        orphan.failure = makeProviderFailure({
+          message:
+            "The previous Pi turn never completed; it was abandoned when the next turn started.",
+          class: "provider_error",
+          retryable: true,
+        });
+        // The orphan's session tree is unreachable by definition here, so skip
+        // the tree-ref RPC and keep finalization local. `finalizeTurn` clears
+        // `activeTurn` before it does anything that can fail, and a failed
+        // emit must not block the incoming turn either.
+        orphan.stopTreeRefs = { turnStartEntryId: null, leafId: null };
+        yield* finalizeTurn(state, false).pipe(
+          Effect.timeout(Duration.seconds(5)),
+          Effect.catchCause((cause) =>
+            Effect.logError("Finalizing an orphaned Pi turn failed.", {
+              cause: Cause.pretty(cause),
+              orphanedProviderTurnId,
+              incomingRunId,
+            }).pipe(Effect.withSpan("PiAdapterV2.discardOrphanedTurn")),
+          ),
+        );
+        return state.activeTurn === null;
+      });
+
       // ── event pump ────────────────────────────────────────
 
       const scheduleSettleProbe = (
@@ -2003,6 +2058,15 @@ export function makePiAdapterV2(
         Effect.catchCause((cause) =>
           sessionEventPermit.withPermits(1)(
             Effect.gen(function* () {
+              // Instrumentation: this is where a dead provider stream becomes a
+              // finalized turn. Without the pretty cause the failure is
+              // invisible outside the process.
+              yield* Effect.logWarning("Pi session event pump stopped.", {
+                cause: Cause.pretty(cause),
+                interruptsOnly: Cause.hasInterruptsOnly(cause),
+                providerThreadId: threadState?.providerThread.id ?? null,
+                activeProviderTurnId: threadState?.activeTurn?.providerTurn.id ?? null,
+              }).pipe(Effect.withSpan("PiAdapterV2.eventPumpStopped"));
               // Transport death finalizes any live turn. Stop-with-restart
               // closes the provider stream cleanly; only an unexpected death
               // is surfaced as an event-stream failure.
@@ -2061,7 +2125,14 @@ export function makePiAdapterV2(
         publish = true,
       ) {
         if (threadState !== null && threadState.activeTurn !== null) {
-          return yield* protocolError("Cannot register a Pi thread while a turn is active");
+          const discarded = yield* discardOrphanedTurn(
+            threadState,
+            threadInput.runId,
+            "registerThread",
+          );
+          if (!discarded) {
+            return yield* protocolError("Cannot register a Pi thread while a turn is active");
+          }
         }
         const existing = threadInput.existingProviderThread;
         const resumeId = existing?.nativeThreadRef?.nativeId;
@@ -2309,6 +2380,9 @@ export function makePiAdapterV2(
             modelSelection: threadInput.modelSelection ?? input.modelSelection,
             runtimePolicy: threadInput.runtimePolicy ?? input.runtimePolicy,
             existingProviderThread: threadInput.providerThread,
+            // Carried through so a resume from a later run can tell an orphaned
+            // turn from one that still belongs to the run being resumed.
+            ...(threadInput.runId === undefined ? {} : { runId: threadInput.runId }),
           }).pipe(
             Effect.mapError(
               (cause) =>
@@ -2334,9 +2408,12 @@ export function makePiAdapterV2(
               return yield* protocolError("Pi session has no registered thread");
             }
             if (state.activeTurn !== null) {
-              return yield* protocolError(
-                `Pi provider thread ${turnInput.providerThread.id} already has an active turn`,
-              );
+              const discarded = yield* discardOrphanedTurn(state, turnInput.runId, "startTurn");
+              if (!discarded) {
+                return yield* protocolError(
+                  `Pi provider thread ${turnInput.providerThread.id} already has an active turn`,
+                );
+              }
             }
             if (
               state.providerThread.nativeThreadRef?.nativeId !==
