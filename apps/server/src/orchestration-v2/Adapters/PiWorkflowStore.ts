@@ -36,9 +36,9 @@
  *
  * @module orchestration-v2/Adapters/PiWorkflowStore
  */
-import { createHash } from "node:crypto";
-import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import * as NodeCrypto from "node:crypto";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -196,8 +196,8 @@ const MAX_RUN_ID_LENGTH = 200;
  */
 export function defaultPiWorkflowStoreRoot(environment?: NodeJS.ProcessEnv): string {
   const configuredHome = environment?.HOME?.trim();
-  return join(
-    configuredHome && configuredHome.length > 0 ? configuredHome : homedir(),
+  return NodePath.join(
+    configuredHome && configuredHome.length > 0 ? configuredHome : NodeOS.homedir(),
     ".pi",
     "workflows",
   );
@@ -209,14 +209,14 @@ export function defaultPiWorkflowStoreRoot(environment?: NodeJS.ProcessEnv): str
  * reader lands on the same directory the writer used.
  */
 export function piWorkflowProjectKey(cwd: string): string {
-  const resolved = resolve(cwd);
+  const resolved = NodePath.resolve(cwd);
   const slug =
-    (basename(resolved) || "project")
+    (NodePath.basename(resolved) || "project")
       .toLowerCase()
       .replace(/[^a-z0-9._-]+/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 48) || "project";
-  const hash = createHash("sha256").update(resolved).digest("hex").slice(0, 12);
+  const hash = NodeCrypto.createHash("sha256").update(resolved).digest("hex").slice(0, 12);
   return `${slug}-${hash}`;
 }
 
@@ -405,7 +405,7 @@ export const makePiWorkflowStore = Effect.fn("makePiWorkflowStore")(function* (
     );
 
   const runsDirFor = (cwd: string): string =>
-    join(options.homeDir, "projects", piWorkflowProjectKey(resolve(cwd)), "runs");
+    NodePath.join(options.homeDir, "projects", piWorkflowProjectKey(NodePath.resolve(cwd)), "runs");
 
   const listRunsForSession: PiWorkflowStoreShape["listRunsForSession"] = (input) =>
     semaphore.withPermit(
@@ -439,7 +439,7 @@ export const makePiWorkflowStore = Effect.fn("makePiWorkflowStore")(function* (
         }> = [];
         for (const fileName of entries.value) {
           if (!fileName.endsWith(".json")) continue;
-          const filePath = join(runsDir, fileName);
+          const filePath = NodePath.join(runsDir, fileName);
           const info = yield* statRunFile(filePath);
           if (info === null) {
             // Listed but unreadable: it exists, so it must not read as gone.
