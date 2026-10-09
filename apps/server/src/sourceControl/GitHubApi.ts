@@ -124,6 +124,11 @@ export interface GitHubRestResponse {
 export interface GitHubRestInput {
   readonly host: string;
   readonly operation: string;
+  /**
+   * The owner of the repository the request is about, when it has one. It selects the login to send
+   * as, so a repository owned by a second signed-in account is read as that account.
+   */
+  readonly account?: string;
   readonly method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   /** Relative to the API root, e.g. `repos/acme/web/pulls/7`; query string included. */
   readonly path: string;
@@ -142,6 +147,11 @@ export interface GitHubRestInput {
 export interface GitHubGraphQlInput {
   readonly host: string;
   readonly operation: string;
+  /**
+   * The owner of the repository the request is about, when it has one. It selects the login to send
+   * as, so a repository owned by a second signed-in account is read as that account.
+   */
+  readonly account?: string;
   readonly query: string;
   readonly variables?: Readonly<Record<string, unknown>>;
   readonly allowReserve?: boolean;
@@ -154,9 +164,10 @@ export class GitHubApi extends Context.Service<
     /** The raw JSON body of a successful GraphQL answer, with `rateLimit` recorded. */
     readonly graphql: (input: GitHubGraphQlInput) => Effect.Effect<string, GitHubApiError>;
     readonly rest: (input: GitHubRestInput) => Effect.Effect<GitHubRestResponse, GitHubApiError>;
-    /** The credential a request to `host` would carry right now. */
+    /** The credential a request to `host` would carry right now, for an optional repository owner. */
     readonly credential: (
       host: string,
+      account?: string,
     ) => Effect.Effect<
       { readonly token: Redacted.Redacted<string>; readonly fingerprint: string },
       GitHubApiError
@@ -359,7 +370,7 @@ export const make = Effect.gen(function* () {
   const gate = yield* Semaphore.make(CONCURRENCY);
 
   const credential: GitHubApi["Service"]["credential"] = Effect.fn("GitHubApi.credential")(
-    function* (host) {
+    function* (host, account) {
       const normalized = normalizeHost(host);
       const pinned = yield* PinnedGitHubCredential;
       if (pinned !== null) {
@@ -372,7 +383,10 @@ export const make = Effect.gen(function* () {
         }
         return { token: pinned.token, fingerprint: pinned.credentialFingerprint };
       }
-      const held = yield* credentials.get(normalized);
+      const held = yield* credentials.get(
+        normalized,
+        account === undefined ? undefined : { account },
+      );
       return { token: held.token, fingerprint: held.fingerprint };
     },
   );
@@ -384,6 +398,8 @@ export const make = Effect.gen(function* () {
   const send = Effect.fn("GitHubApi.send")(function* (input: {
     readonly host: string;
     readonly operation: string;
+    /** The repository owner the request is about, when it has one. */
+    readonly account?: string | undefined;
     readonly request: HttpClientRequest.HttpClientRequest;
     readonly maxResponseBytes: number;
     readonly timeout?: Duration.Input | undefined;
@@ -401,7 +417,7 @@ export const make = Effect.gen(function* () {
       "http.request.method": input.request.method,
       "url.path": new URL(input.request.url).pathname,
     });
-    const { token, fingerprint } = yield* credential(host);
+    const { token, fingerprint } = yield* credential(host, input.account);
     const scope = yield* SourceControlRateLimit.CredentialScope;
     const key = { provider: "github" as const, host };
     const run = Effect.gen(function* () {
@@ -492,7 +508,7 @@ export const make = Effect.gen(function* () {
           // The source may hold a newer token than the one that was refused.
           Unauthorized: () =>
             credentials
-              .invalidate(host)
+              .invalidate(host, input.account === undefined ? undefined : { account: input.account })
               .pipe(Effect.andThen(Effect.fail(new GitHubApiAuthenticationError(context)))),
           NotFound: () => Effect.fail(new GitHubApiNotFoundError(context)),
           Failed: ({ messages }) =>
@@ -530,6 +546,7 @@ export const make = Effect.gen(function* () {
         send({
           host: input.host,
           operation: input.operation,
+          account: input.account,
           request,
           maxResponseBytes: input.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
           timeout: input.timeout,
@@ -543,7 +560,7 @@ export const make = Effect.gen(function* () {
   const graphql: GitHubApi["Service"]["graphql"] = Effect.fn("GitHubApi.graphql")(
     function* (input) {
       const host = normalizeHost(input.host);
-      const { fingerprint } = yield* credential(host);
+      const { fingerprint } = yield* credential(host, input.account);
       const scope = (yield* SourceControlRateLimit.CredentialScope) || fingerprint;
       const allowReserve = input.allowReserve ?? (yield* AllowGitHubReserve);
       // The document, never its variables: user text (bodies, search terms) travels as variables.
@@ -564,6 +581,7 @@ export const make = Effect.gen(function* () {
         const response = yield* send({
           host,
           operation: input.operation,
+          account: input.account,
           request: HttpClientRequest.post(gitHubApiUrls(host).graphql).pipe(
             HttpClientRequest.acceptJson,
             HttpClientRequest.bodyJsonUnsafe({ query, variables: input.variables ?? {} }),

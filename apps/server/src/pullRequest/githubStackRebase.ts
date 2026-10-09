@@ -60,7 +60,9 @@ export const cascadeRebaseStack = Effect.fn("cascadeRebaseStack")(function* (inp
   const api = yield* GitHubApi.GitHubApi;
   const process = yield* VcsProcess.VcsProcess;
   const fileSystem = yield* FileSystem.FileSystem;
-  const { token } = yield* api.credential(input.host);
+  // Fetching and pushing below act on the repository's own remote, so the token must belong to the
+  // account that owns it rather than to whichever login `gh` has active.
+  const { token } = yield* api.credential(input.host, input.repository.split("/")[0] ?? "");
   const first = input.layers[0];
   if (first === undefined) return 0;
   const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-stack-rebase-" }).pipe(

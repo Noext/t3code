@@ -818,6 +818,9 @@ export const make = Effect.gen(function* () {
     const response = yield* rest(cwd, {
       host: locator.host,
       operation: "getRepository",
+      // The owner is what decides the login: a repository of a second signed-in account is read as
+      // that account instead of whatever `gh` has active.
+      account: locator.owner,
       path: `repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}`,
       allowReserve: true,
     });
@@ -1022,6 +1025,8 @@ export const make = Effect.gen(function* () {
           host,
           operation: "createRepository",
           method: "POST",
+          // An organization's repository is created by a login that may belong to another account.
+          account: owner ?? "",
           path:
             isViewer || owner === null ? "user/repos" : `orgs/${encodeURIComponent(owner)}/repos`,
           body: { name, private: input.visibility === "private" },
@@ -1046,6 +1051,7 @@ export const make = Effect.gen(function* () {
           host: locator.host,
           operation: "createPullRequest",
           method: "POST",
+          account: locator.owner,
           path: `repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}/pulls`,
           // `owner:branch` is how the REST API takes a fork's head, the same as `gh --head`.
           // gh allows maintainer edits unless told otherwise; the API's default is not documented.
