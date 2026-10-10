@@ -96,7 +96,12 @@ import {
   type PiRpcRecord,
 } from "./PiRpc.ts";
 import { emptyPiWorkflowTracker, reconcilePiWorkflowRuns } from "./PiWorkflowProgress.ts";
-import { defaultPiWorkflowStoreRoot, makePiWorkflowStore } from "./PiWorkflowStore.ts";
+import { defaultPiSubagentRunsRoot, makePiSubagentRunStore } from "./PiSubagentRunStore.ts";
+import {
+  defaultPiWorkflowStoreRoot,
+  makePiWorkflowStore,
+  type PiWorkflowRunListing,
+} from "./PiWorkflowStore.ts";
 import {
   buildPiRpcLaunch,
   materializePiT3McpExtension,
@@ -245,6 +250,13 @@ export interface PiAdapterV2Options {
   readonly workflowStoreRoot?: string;
   /** Pi session directory the `pi-workflows-claude` feed writes under. */
   readonly workflowSessionDir?: string;
+  /**
+   * Root of `pi-subagents`' detached async runs (`<tempRoot>/async-subagent-runs`).
+   * This is the only live source for a fan-out launched through that extension:
+   * the run state lives in the extension's own temp root, which the operator's
+   * workflow store never sees. Absent skips the source.
+   */
+  readonly workflowSubagentRunsRoot?: string;
   /** Cadence between workflow-store sweeps. Defaults to every three seconds. */
   readonly workflowSweepIntervalMs?: number;
 }
@@ -459,6 +471,15 @@ export function makePiAdapterV2(
               feed: yield* makePiClaudeWorkflowStore({
                 sessionDir: options.workflowSessionDir,
               }).pipe(Effect.provideService(FileSystem.FileSystem, options.fileSystem)),
+              // A third source, and the one a pi-subagents fan-out is visible
+              // through: the extension writes each detached run's state under its
+              // own temp root instead of the operator's workflow store.
+              subagents:
+                options.workflowSubagentRunsRoot === undefined
+                  ? null
+                  : yield* makePiSubagentRunStore({
+                      runsRoot: options.workflowSubagentRunsRoot,
+                    }).pipe(Effect.provideService(FileSystem.FileSystem, options.fileSystem)),
             };
       const connection: PiRpcConnection = yield* makePiRpcConnection({
         command: options.settings.binaryPath || "pi",
@@ -2988,25 +3009,32 @@ export function makePiAdapterV2(
         const sweep = Effect.gen(function* () {
           const sessionId = workflowSessionId;
           if (sessionId === null) return;
-          // Both stores are read before anything is concluded: a store that
+          // Every store is read before anything is concluded: a store that
           // cannot be read at all leaves the round inconclusive and keeps the
           // tracker, rather than reporting its runs as ended.
-          const [snapshotListing, feedListing] = yield* Effect.all(
+          const [snapshotListing, feedListing, subagentsListing] = yield* Effect.all(
             [
               workflowStores.snapshot.listRunsForSession({ cwd, sessionIds: [sessionId] }),
               workflowStores.feed.listRunsForSession({
                 sessionIds: [sessionId],
                 ...(workflowSessionFile === null ? {} : { sessionFile: workflowSessionFile }),
               }),
+              workflowStores.subagents === null
+                ? Effect.succeed<PiWorkflowRunListing>({ runs: [], unresolvedRunIds: [] })
+                : workflowStores.subagents.listRunsForSession({
+                    cwd,
+                    sessionIds: [sessionId],
+                  }),
             ],
-            { concurrency: 2 },
+            { concurrency: 3 },
           );
           const emittedAt = yield* DateTime.now;
           const reconciled = reconcilePiWorkflowRuns({
-            runs: [...snapshotListing.runs, ...feedListing.runs],
+            runs: [...snapshotListing.runs, ...feedListing.runs, ...subagentsListing.runs],
             unresolvedRunIds: [
               ...snapshotListing.unresolvedRunIds,
               ...feedListing.unresolvedRunIds,
+              ...subagentsListing.unresolvedRunIds,
             ],
             tracker,
             context: {
@@ -3211,6 +3239,7 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
         idAllocator,
         serverConfig,
         workflowStoreRoot: defaultPiWorkflowStoreRoot(environment),
+        workflowSubagentRunsRoot: defaultPiSubagentRunsRoot(environment),
         workflowSessionDir: defaultPiClaudeWorkflowSessionDir({
           environment,
           launchArgs: resolvedLaunchArgs.ok ? resolvedLaunchArgs.args : [],
@@ -3251,6 +3280,7 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, PiAdapterV2Dr
         idAllocator,
         serverConfig,
         workflowStoreRoot: defaultPiWorkflowStoreRoot(hostEnvironment),
+        workflowSubagentRunsRoot: defaultPiSubagentRunsRoot(hostEnvironment),
         workflowSessionDir: defaultPiClaudeWorkflowSessionDir({
           environment: hostEnvironment,
           launchArgs: resolvedLaunchArgs.ok ? resolvedLaunchArgs.args : [],
