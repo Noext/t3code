@@ -16,6 +16,14 @@
  * reports the session settled. An extension can start detached compaction as
  * that signal unwinds, so the adapter confirms Pi is idle before terminalizing.
  *
+ * Provider-initiated turns: Pi extensions resume the session on their own —
+ * pi-subagents wakes the parent as soon as a background fan-out ends. That
+ * turn has no run behind it, so the adapter holds its records and asks
+ * orchestration for a continuation run (an adapter-buffered wake, the same
+ * contract Claude and OpenCode2 use) whose turn ingests them. Only a wake that
+ * nothing can own — Stop, an archived thread, an unroutable session — stops the
+ * runtime, and it reports that as a provider stop rather than a stream failure.
+ *
  * Extension UI: Pi extensions raise dialogs through `extension_ui_request`.
  * Dialog methods become v2 runtime requests (`confirm` → approval_request,
  * `select`/`input`/`editor` → user_input_request); answers travel back as
@@ -80,6 +88,7 @@ import {
   type ProviderAdapterDriver,
   type ProviderAdapterDriverCreateInput,
 } from "../ProviderAdapterDriver.ts";
+import * as ProviderContinuationRequests from "../ProviderContinuationRequests.ts";
 import { makeProviderFailure, makeProviderRetryTurnItem } from "../ProviderFailure.ts";
 import { turnScopedSelectionTransition } from "../ProviderSelectionTransition.ts";
 import {
@@ -362,6 +371,12 @@ interface ActivePiTurn {
   failure: ReturnType<typeof makeProviderFailure> | null;
   /** Session-tree refs read just before Stop terminates Pi, when no read is possible later. */
   stopTreeRefs?: PiTurnTreeRefs | null;
+  /**
+   * Pi's own user entry for the extension wake this turn was opened for. The
+   * wake predates the run, so the cursor baselined at registration no longer
+   * bounds it; null on turns whose prompt the adapter sent itself.
+   */
+  readonly wakeTurnStartEntryId: string | null;
 }
 
 interface PiTurnTreeRefs {
@@ -377,6 +392,34 @@ interface PendingPiPrompt {
   runtimeRequest: OrchestrationV2RuntimeRequest;
   readonly node: OrchestrationV2ExecutionNode;
   readonly turnItem: OrchestrationV2TurnItem;
+}
+
+/**
+ * A turn Pi started on its own — an extension resuming the session once
+ * background work ended. Nothing owns its timeline yet, so its records are
+ * held here until the continuation run T3 opens for them replays them.
+ */
+interface PiWake {
+  /** Records from the wake's `agent_start` on, replayed into the continuation turn. */
+  readonly events: Array<PiRpcRecord>;
+  readonly generation: number;
+  /** Native session file the wake belongs to; a switch makes the records stale. */
+  readonly sessionId: string | null;
+  /** Pi's own user entry for the wake, read while the cursor still bounds it. */
+  turnStartEntryId: string | null;
+  /** Cleared once the wake's native turn reported itself settled. */
+  running: boolean;
+  /** Stopped, or taken by a user turn: its continuation is not needed. */
+  dropped: boolean;
+}
+
+/**
+ * A turn T3 opened only to ingest an extension wake: the continuation message
+ * the orchestrator dispatched is a marker for the timeline, not a prompt, so
+ * the adapter must never send it to Pi.
+ */
+function isPiProviderContinuationTurn(input: ProviderAdapter.ProviderAdapterV2TurnInput): boolean {
+  return input.message.createdBy === "agent" && input.message.creationSource === "provider";
 }
 
 /**
@@ -530,6 +573,10 @@ export function makePiAdapterV2(
       // serialize the two paths to stop `turn.terminal` from overtaking the
       // dialog's own resolution updates.
       const sessionEventPermit = yield* Semaphore.make(1);
+      // Adapter-buffered wake offers travel through this reference so
+      // orchestration can open the run that ingests them. Its default drops
+      // offers, which keeps direct callers and tests dependency-free.
+      const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
       let threadState: PiThreadState | null = null;
       let registrationAttempted = false;
       let lastNativeThreadId: string | null = null;
@@ -550,9 +597,14 @@ export function makePiAdapterV2(
       // not mistaken for an unexpected transport failure.
       let stopRequested = false;
       // Pi extensions can trigger an agent turn after the owning T3 turn has
-      // settled. Until orchestration has a first-class provider-initiated run,
-      // stop that runtime before it can execute tools without a timeline owner.
-      let unsolicitedActivityDetected = false;
+      // settled. The turn is held here until the continuation run T3 opens for
+      // it takes it, so its work reaches the timeline instead of executing
+      // tools with no owner.
+      let wake: PiWake | null = null;
+      let wakeGeneration = 0;
+      // Set when an unowned turn was dropped and the runtime stopped for it, so
+      // the stream end reads as a provider stop rather than a failure.
+      let unownedTurnStopped = false;
       let appliedModel: string | null = null;
       let appliedThinking: string | null = null;
       /** Last thread title synced into pi's session name (`/resume` listing). */
@@ -1517,6 +1569,10 @@ export function makePiAdapterV2(
         yield* cancelPendingPrompts(completedAt);
         const treeRefs =
           turn.stopTreeRefs !== undefined ? turn.stopTreeRefs : yield* captureTurnTreeRefs();
+        // A continuation turn's own start predates its run: its user entry came
+        // from the extension wake the adapter held, before this run re-baselined
+        // the cursor, so the wake's capture is the only ref that has it.
+        const turnStartEntryId = turn.wakeTurnStartEntryId ?? treeRefs?.turnStartEntryId ?? null;
         const tokenUsage = readUsage
           ? yield* readTokenUsage(turn.latestCompactionAfterTokens, completedAt)
           : undefined;
@@ -1527,9 +1583,7 @@ export function makePiAdapterV2(
           threadId: turn.turnInput.threadId,
           providerTurn: {
             ...turn.providerTurn,
-            ...(treeRefs?.turnStartEntryId == null
-              ? {}
-              : { nativeTurnRef: providerRef(treeRefs.turnStartEntryId) }),
+            ...(turnStartEntryId == null ? {} : { nativeTurnRef: providerRef(turnStartEntryId) }),
             status: turn.interrupted ? "interrupted" : failure !== null ? "failed" : "completed",
             completedAt,
             ...(tokenUsage === undefined ? {} : { tokenUsage }),
@@ -1653,6 +1707,118 @@ export function makePiAdapterV2(
         return state.activeTurn === null;
       });
 
+      // ── provider-initiated wake ───────────────────────────
+
+      const isHeldWake = (held: PiWake) => wake !== null && wake.generation === held.generation;
+
+      /**
+       * Records a held turn keeps for its continuation. Extension dialogs and
+       * errors, and the adapter's own control records, are handled immediately
+       * instead: they are turn-independent, and a dialog must not wait for a run
+       * before it can be answered.
+       */
+      const buffersIntoWake = (event: PiRpcRecord): boolean => {
+        const type = event["type"];
+        if (type === "extension_ui_request" || type === "extension_error") return false;
+        return typeof type !== "string" || !type.startsWith("t3.");
+      };
+
+      /**
+       * Stops a turn nothing can own. Pi would otherwise keep executing tools
+       * with no timeline owner, so its runtime dies the way Stop kills it, and
+       * the pump reports that end as a provider stop rather than a failure.
+       */
+      const stopUnownedTurn = Effect.fnUntraced(function* (held: PiWake, reason: string) {
+        if (isHeldWake(held)) wake = null;
+        held.events.length = 0;
+        held.dropped = true;
+        if (unownedTurnStopped) return;
+        unownedTurnStopped = true;
+        yield* Effect.logWarning("Stopped Pi after dropping its provider-initiated turn.", {
+          reason,
+          providerSessionId: input.providerSessionId,
+          providerThreadId: threadState?.providerThread.id ?? null,
+        }).pipe(Effect.withSpan("PiAdapterV2.providerWakeDropped"));
+        yield* connection.terminate.pipe(Effect.ignore);
+      });
+
+      /**
+       * Hold the turn Pi started on its own and ask orchestration for the run
+       * that owns it. The offer is adapter-buffered: the run it dispatches is an
+       * ordinary turn into which the records held here are replayed, so the
+       * extension's work lands in the timeline with a run behind it.
+       */
+      const beginWake = Effect.fnUntraced(function* (state: PiThreadState | null) {
+        if (wake !== null) return;
+        const providerThread = state?.providerThread ?? threadState?.providerThread ?? null;
+        const held: PiWake = {
+          events: [],
+          generation: (wakeGeneration += 1),
+          sessionId: lastNativeThreadId,
+          turnStartEntryId: null,
+          running: true,
+          dropped: false,
+        };
+        const threadId = providerThread?.appThreadId ?? null;
+        if (providerThread === null || threadId === null) {
+          // A session whose thread never registered has no route back to an app
+          // thread, so no run could ever own the turn.
+          yield* stopUnownedTurn(held, "unroutable");
+          return;
+        }
+        wake = held;
+        yield* Effect.logInfo("Pi started a turn without an active T3 turn.", {
+          providerSessionId: input.providerSessionId,
+          providerThreadId: providerThread.id,
+          threadId,
+        }).pipe(Effect.withSpan("PiAdapterV2.providerWakeStarted"));
+        // Pi appended the wake's own user entry after the last captured leaf.
+        // Read the tree now: this run's registration re-baselines the cursor
+        // past that entry, and the continuation turn needs it as its ref.
+        const refs = yield* captureTurnTreeRefs();
+        held.turnStartEntryId = refs?.turnStartEntryId ?? null;
+        yield* continuationRequests.offer({
+          threadId,
+          providerThreadId: providerThread.id,
+          driver: PI_PROVIDER,
+          detail: null,
+          clearIfCurrent: () =>
+            Effect.suspend(() =>
+              isHeldWake(held)
+                ? sessionEventPermit.withPermits(1)(stopUnownedTurn(held, "continuation-dropped"))
+                : Effect.void,
+            ),
+          dispatchIfCurrent: (dispatch) =>
+            Effect.suspend(() => (isHeldWake(held) ? Effect.asSome(dispatch) : Effect.succeedNone)),
+        });
+      });
+
+      /** Claims the held wake for the continuation turn that will ingest it. */
+      const claimWake = (): PiWake | null => {
+        const held = wake;
+        if (held === null || held.dropped) return null;
+        wake = null;
+        return held;
+      };
+
+      /**
+       * A user turn took the session: its own prompt owns the timeline now, so
+       * the held wake is not needed. Pi keeps running, but the unowned turn is
+       * aborted so it cannot interleave with the prompt this turn sends.
+       */
+      const releaseWakeForUserTurn = Effect.fnUntraced(function* () {
+        const held = claimWake();
+        if (held === null) return;
+        held.dropped = true;
+        yield* Effect.logInfo("A user turn took a Pi session holding provider-initiated work.", {
+          providerThreadId: threadState?.providerThread.id ?? null,
+        }).pipe(Effect.withSpan("PiAdapterV2.providerWakeTakenByUserTurn"));
+        if (!held.running) return;
+        yield* sessionEventPermit.withPermits(1)(
+          request({ type: "abort" }, 2_000).pipe(Effect.ignore),
+        );
+      });
+
       // ── event pump ────────────────────────────────────────
 
       const scheduleSettleProbe = (
@@ -1697,9 +1863,7 @@ export function makePiAdapterV2(
         switch (event["type"]) {
           case "agent_start": {
             if (turn === null) {
-              unsolicitedActivityDetected = true;
-              yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
-              yield* connection.terminate;
+              yield* beginWake(state);
               return;
             }
             turn.sawAgentActivity = true;
@@ -2073,7 +2237,26 @@ export function makePiAdapterV2(
       yield* Effect.gen(function* () {
         while (true) {
           const event = yield* Queue.take(connection.events);
-          yield* sessionEventPermit.withPermits(1)(handleSessionEvent(event));
+          yield* sessionEventPermit.withPermits(1)(
+            Effect.gen(function* () {
+              // While a wake is held, its records wait for the continuation run.
+              // Replaying them is what gives that run its turn content.
+              if (wake !== null && !wake.dropped && buffersIntoWake(event)) {
+                wake.events.push(event);
+                // A user turn takes a settled session as easily as a live one:
+                // only a wake whose native turn is still running is aborted.
+                if (event["type"] === "agent_start") wake.running = true;
+                if (event["type"] === "agent_settled") wake.running = false;
+                return;
+              }
+              yield* handleSessionEvent(event);
+              // This `agent_start` may have just begun a wake, and its own
+              // record belongs to the held turn.
+              if (wake !== null && !wake.dropped && event["type"] === "agent_start") {
+                wake.events.push(event);
+              }
+            }),
+          );
         }
       }).pipe(
         Effect.catchCause((cause) =>
@@ -2103,8 +2286,8 @@ export function makePiAdapterV2(
                     });
                 yield* finalizeTurn(state, false);
               }
-              if (unsolicitedActivityDetected) {
-                yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
+              if (unownedTurnStopped) {
+                yield* updateProviderSession("stopped", PI_UNSOLICITED_ACTIVITY_ERROR);
                 yield* Queue.end(events);
               } else if (stopRequested) {
                 yield* updateProviderSession("stopped", null);
@@ -2215,6 +2398,20 @@ export function makePiAdapterV2(
           return yield* protocolError("Pi did not create a distinct session file");
         }
         lastNativeThreadId = nativeId;
+        // Records held for a wake belong to the session that produced them. A
+        // switch to a different file makes them un-replayable, so drop the wake
+        // without stopping the runtime this run is about to use.
+        if (wake !== null && wake.sessionId !== null && wake.sessionId !== nativeId) {
+          const stale = wake;
+          wake = null;
+          stale.events.length = 0;
+          stale.dropped = true;
+          yield* Effect.logWarning("Discarded a Pi wake held for another session.", {
+            providerThreadId: threadState?.providerThread.id ?? null,
+            sessionId: stale.sessionId,
+            nativeId,
+          }).pipe(Effect.withSpan("PiAdapterV2.providerWakeSessionChanged"));
+        }
         const createdAt = yield* DateTime.now;
         const providerThread: OrchestrationV2ProviderThread =
           existing !== undefined
@@ -2460,6 +2657,12 @@ export function makePiAdapterV2(
                 Effect.ignore,
               );
             }
+            // A continuation run exists to ingest the wake the adapter held for
+            // it. Any other turn takes the session from that wake instead, since
+            // its own prompt owns the timeline from here on.
+            const continuation = isPiProviderContinuationTurn(turnInput);
+            const continuationWake = continuation ? claimWake() : null;
+            if (!continuation) yield* releaseWakeForUserTurn();
             // Resolved before the turn is installed: a failure here (an
             // unreadable attachment) must not leave `activeTurn` set, which
             // would reject every later turn as already active.
@@ -2467,9 +2670,13 @@ export function makePiAdapterV2(
             // extension's before_agent_start system-prompt hook, never by
             // wrapping the user text: a wrapped first message would no
             // longer start with "/" and slash commands would stop expanding.
-            const compactCommand = parsePiCompactCommand(turnInput.message.text);
+            // Nothing is prompted on the continuation path: Pi already ran the
+            // turn this run is here to ingest.
+            const compactCommand = continuation
+              ? null
+              : parsePiCompactCommand(turnInput.message.text);
             const payload =
-              compactCommand === null
+              compactCommand === null && !continuation
                 ? yield* resolvePromptPayload(turnInput.message.text, turnInput.message.attachments)
                 : null;
             const startedAt = yield* DateTime.now;
@@ -2511,6 +2718,7 @@ export function makePiAdapterV2(
               activeCompaction: null,
               activeProviderRetry: null,
               failure: null,
+              wakeTurnStartEntryId: continuationWake?.turnStartEntryId ?? null,
             };
             // Only the install/send/start-event boundary excludes the event
             // pump. Earlier correlated requests must leave the pump free so
@@ -2550,6 +2758,25 @@ export function makePiAdapterV2(
               yield* updateProviderSession("running", null);
               if (outOfTurnExtensionErrors.length > 0) {
                 yield* Queue.offer(connection.events, { type: "t3.flush_extension_errors" });
+              }
+              // Replay what Pi ran while nothing owned it, so this run's turn
+              // carries the wake's output. A wake whose native turn already
+              // ended settles from the replayed terminal signal; one that kept
+              // running continues on the live stream. Replay stops at the first
+              // record that terminalizes the turn: the rest belongs to it.
+              if (continuationWake !== null) {
+                for (const held of continuationWake.events) {
+                  if (state.activeTurn !== activeTurn) break;
+                  yield* handleSessionEvent(held);
+                }
+              }
+              // A wake taken by a Stop, or whose native turn this run's session
+              // switch cut, has nothing left to wait for: probe for idleness the
+              // way a settled provider turn does.
+              if (continuation && state.activeTurn === activeTurn) {
+                activeTurn.settleWhenIdle = true;
+                activeTurn.settleProbeGeneration += 1;
+                yield* scheduleSettleProbe(activeTurn, true);
               }
             }).pipe(
               sessionEventPermit.withPermits(1),
