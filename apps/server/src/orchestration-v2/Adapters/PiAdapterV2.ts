@@ -136,6 +136,13 @@ const PI_SESSION_TIMEOUT_MS = 60_000;
 const PI_SKILL_DISCOVERY_TIMEOUT_MS = 4_000;
 const PI_UNSOLICITED_ACTIVITY_ERROR =
   "Pi started agent work outside an active T3 turn. The session was stopped to prevent invisible tool execution.";
+/**
+ * How long an offered wake waits for the continuation run that owns it before
+ * the adapter treats it as unroutable. A drained offer dispatches within
+ * milliseconds, so this only catches an offer nothing ever takes — a missing
+ * continuation worker, which would otherwise leave the turn held forever.
+ */
+const PI_WAKE_CONTINUATION_DEADLINE = Duration.seconds(60);
 const SETTLE_PROBE_MAX_ATTEMPTS = 3;
 const SETTLE_PROBE_RETRY_DELAY = Duration.millis(100);
 
@@ -268,6 +275,25 @@ export interface PiAdapterV2Options {
   readonly workflowSubagentRunsRoot?: string;
   /** Cadence between workflow-store sweeps. Defaults to every three seconds. */
   readonly workflowSweepIntervalMs?: number;
+  /**
+   * Adapter-buffered wake offers. The orchestration runtime provides this to
+   * the provider instances that materialize the adapter, so it is the same
+   * queue its continuation worker drains. Absent leaves a provider-initiated
+   * turn unroutable, which stops the runtime instead of holding it forever.
+   */
+  readonly continuationRequests?: PiContinuationRequests;
+}
+
+/**
+ * The part of `ProviderContinuationRequests` the adapter needs. It is captured
+ * when the adapter is created rather than read per call: a wake is offered from
+ * the session's event-pump fiber, whose context does not carry the services the
+ * orchestration runtime was built with.
+ */
+export interface PiContinuationRequests {
+  readonly offer: (
+    request: ProviderContinuationRequests.ProviderContinuationRequest,
+  ) => Effect.Effect<void>;
 }
 
 /** Concatenate the `text` fields of a Pi content-block array. */
@@ -409,6 +435,8 @@ interface PiWake {
   turnStartEntryId: string | null;
   /** Cleared once the wake's native turn reported itself settled. */
   running: boolean;
+  /** Set when the continuation worker took the dispatch that owns the wake. */
+  dispatched: boolean;
   /** Stopped, or taken by a user turn: its continuation is not needed. */
   dropped: boolean;
 }
@@ -573,10 +601,11 @@ export function makePiAdapterV2(
       // serialize the two paths to stop `turn.terminal` from overtaking the
       // dialog's own resolution updates.
       const sessionEventPermit = yield* Semaphore.make(1);
-      // Adapter-buffered wake offers travel through this reference so
-      // orchestration can open the run that ingests them. Its default drops
-      // offers, which keeps direct callers and tests dependency-free.
-      const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      // Wake offers travel through the service the provider instance was
+      // materialized with, which is the queue the orchestration runtime's
+      // continuation worker drains. Reading it here instead resolves this
+      // fiber's context, which carries neither service.
+      const continuationRequests = options.continuationRequests;
       let threadState: PiThreadState | null = null;
       let registrationAttempted = false;
       let lastNativeThreadId: string | null = null;
@@ -1757,6 +1786,7 @@ export function makePiAdapterV2(
           sessionId: lastNativeThreadId,
           turnStartEntryId: null,
           running: true,
+          dispatched: false,
           dropped: false,
         };
         const threadId = providerThread?.appThreadId ?? null;
@@ -1764,6 +1794,12 @@ export function makePiAdapterV2(
           // A session whose thread never registered has no route back to an app
           // thread, so no run could ever own the turn.
           yield* stopUnownedTurn(held, "unroutable");
+          return;
+        }
+        if (continuationRequests === undefined) {
+          // Nothing drains the offer, so holding the turn would hide its work
+          // instead of giving it an owner.
+          yield* stopUnownedTurn(held, "no-continuation-worker");
           return;
         }
         wake = held;
@@ -1789,8 +1825,29 @@ export function makePiAdapterV2(
                 : Effect.void,
             ),
           dispatchIfCurrent: (dispatch) =>
-            Effect.suspend(() => (isHeldWake(held) ? Effect.asSome(dispatch) : Effect.succeedNone)),
+            Effect.suspend(() =>
+              isHeldWake(held)
+                ? Effect.tap(Effect.asSome(dispatch), () =>
+                    Effect.sync(() => {
+                      held.dispatched = true;
+                    }),
+                  )
+                : Effect.succeedNone,
+            ),
         });
+        // An offer nothing ever takes would hold the wake forever. The worker
+        // accepts it within milliseconds, so waiting past the deadline means no
+        // continuation run is coming.
+        yield* Effect.sleep(PI_WAKE_CONTINUATION_DEADLINE).pipe(
+          Effect.andThen(
+            Effect.suspend(() =>
+              isHeldWake(held) && !held.dispatched
+                ? stopUnownedTurn(held, "continuation-offer-not-drained")
+                : Effect.void,
+            ),
+          ),
+          Effect.forkIn(scope),
+        );
       });
 
       /** Claims the held wake for the continuation turn that will ingest it. */
@@ -3455,6 +3512,9 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
       const fileSystem = yield* FileSystem.FileSystem;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const serverConfig = yield* ServerConfig.ServerConfig;
+      // Resolved while the provider instance is materialized, which is the
+      // context the orchestration runtime provides it to (see Antigravity).
+      const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
       const environment = mergeProviderInstanceEnvironment(input.environment, hostEnvironment);
       const resolvedLaunchArgs = resolvePiLaunchArgs(input.config.launchArgs);
       return makePiAdapterV2({
@@ -3465,6 +3525,7 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
         fileSystem,
         idAllocator,
         serverConfig,
+        continuationRequests,
         workflowStoreRoot: defaultPiWorkflowStoreRoot(environment),
         workflowSubagentRunsRoot: defaultPiSubagentRunsRoot(environment),
         workflowSessionDir: defaultPiClaudeWorkflowSessionDir({
@@ -3497,6 +3558,7 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, PiAdapterV2Dr
       const fileSystem = yield* FileSystem.FileSystem;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const serverConfig = yield* ServerConfig.ServerConfig;
+      const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
       const resolvedLaunchArgs = resolvePiLaunchArgs(DEFAULT_PI_SETTINGS.launchArgs);
       return makePiAdapterV2({
         instanceId: PI_DEFAULT_INSTANCE_ID,
@@ -3506,6 +3568,7 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, PiAdapterV2Dr
         fileSystem,
         idAllocator,
         serverConfig,
+        continuationRequests,
         workflowStoreRoot: defaultPiWorkflowStoreRoot(hostEnvironment),
         workflowSubagentRunsRoot: defaultPiSubagentRunsRoot(hostEnvironment),
         workflowSessionDir: defaultPiClaudeWorkflowSessionDir({
