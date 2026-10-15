@@ -38,6 +38,12 @@ for (const file of ENV_FILES) {
     continue;
   }
   const target = NodePath.join(worktree, file);
+  // Running this in the main checkout itself makes `source` and `target` the
+  // same file: the `rmSync` + `symlinkSync` below would then replace the real
+  // env file with a symlink to itself. That link resolves to nothing, and the
+  // `isFile()` check above reports it as "not a regular file" for every later
+  // worktree — so each one silently got no env file at all.
+  if (NodePath.resolve(source) === NodePath.resolve(target)) continue;
   const existing = NodeFS.lstatSync(target, { throwIfNoEntry: false });
   if (existing && !existing.isSymbolicLink()) continue;
   if (existing) NodeFS.rmSync(target);
