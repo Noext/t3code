@@ -10,7 +10,18 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
-const ENV_FILES = [".env", NodePath.join("infra", "relay", ".env")];
+// `.env` is required: it carries the dev credentials every worktree's dev server
+// needs, so a worktree without it is broken even though it looks ready. The
+// relay's `infra/relay/.env` is optional on purpose: the relay is a separate
+// deployment and most machines (including this one) never create that file, so
+// its absence must not fail a worktree setup.
+const REQUIRED_ENV_FILES = [".env"];
+const OPTIONAL_ENV_FILES = [NodePath.join("infra", "relay", ".env")];
+const ENV_FILES = [...REQUIRED_ENV_FILES, ...OPTIONAL_ENV_FILES];
+
+// `statSync` follows symlinks, so a link whose source vanished is not readable.
+const isReadableFile = (path: string): boolean =>
+  NodeFS.statSync(path, { throwIfNoEntry: false })?.isFile() === true;
 
 const projectRoot = process.env.T3CODE_PROJECT_ROOT;
 if (!projectRoot) {
@@ -48,6 +59,24 @@ for (const file of ENV_FILES) {
   if (existing && !existing.isSymbolicLink()) continue;
   if (existing) NodeFS.rmSync(target);
   NodeFS.symlinkSync(source, target);
+}
+
+// The link loop above is best-effort, so a required env file that never arrived
+// left a worktree indistinguishable from a ready one. Check readability from the
+// worktree now: a missing source, a source that is not a regular file, and a
+// broken symlink all land here as "not readable".
+const missingEnvFiles = REQUIRED_ENV_FILES.filter(
+  (file) => !isReadableFile(NodePath.join(worktree, file)),
+);
+if (missingEnvFiles.length > 0) {
+  process.stderr.write(
+    `Setup worktree failed: ${missingEnvFiles.join(", ")} is not readable from ${worktree}.\n` +
+      `Worktree env files are symlinks into the main checkout ${projectRoot}, which does not expose ` +
+      `${missingEnvFiles.join(", ")} as a regular file.\n` +
+      `Recreate it in the main checkout (\`make poste\` in the infra repo, or restore the file by hand), ` +
+      `then re-run the worktree setup (t3.json "Setup Worktree", or \`node scripts/setup-worktree.ts\` with T3CODE_PROJECT_ROOT set).\n`,
+  );
+  process.exit(1);
 }
 
 const warm = NodeChildProcess.spawnSync(
