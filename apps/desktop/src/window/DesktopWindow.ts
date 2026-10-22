@@ -11,6 +11,7 @@ import * as Electron from "electron";
 import { type DesktopSnapShotEvent, DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts";
 
 import * as DesktopAssets from "../app/DesktopAssets.ts";
+import { isWslgSession } from "../app/DesktopPreReadyPlatform.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import { makeComponentLogger } from "../app/DesktopObservability.ts";
 import * as ElectronMenu from "../electron/ElectronMenu.ts";
@@ -94,6 +95,60 @@ export type DesktopWindowError =
 
 export type MainWindowZoomDirection = "in" | "out" | "reset";
 
+/**
+ * Under WSLg, `setFullScreen` asks for the X screen size (the full panel) while
+ * the compositor's RDP surface is the Windows work area, so the window overflows
+ * by the taskbar height and the compositor clips it — the app looks shifted ~60px
+ * up and to the right. `maximize` instead returns exactly the area the compositor
+ * can actually draw, so it is the closest thing to fullscreen that does not
+ * overflow. Everywhere else the native fullscreen toggle stays correct.
+ */
+export function isSameWindowBounds(
+  a: Pick<Electron.Rectangle, "x" | "y" | "width" | "height">,
+  b: Pick<Electron.Rectangle, "x" | "y" | "width" | "height">,
+  tolerance = 2,
+): boolean {
+  return (
+    Math.abs(a.x - b.x) <= tolerance &&
+    Math.abs(a.y - b.y) <= tolerance &&
+    Math.abs(a.width - b.width) <= tolerance &&
+    Math.abs(a.height - b.height) <= tolerance
+  );
+}
+
+export type MainWindowFullscreenAction =
+  | "enter-fullscreen"
+  | "leave-fullscreen"
+  | "fill"
+  | "restore";
+
+export function resolveMainWindowFullscreenAction(input: {
+  readonly isWslg: boolean;
+  readonly isFullScreen: boolean;
+  readonly isFilled: boolean;
+}): MainWindowFullscreenAction {
+  if (input.isFullScreen) return "leave-fullscreen";
+  if (!input.isWslg) return "enter-fullscreen";
+  return input.isFilled ? "restore" : "fill";
+}
+
+/**
+ * The rectangle a WSLg window is moved to instead of `maximize()`/`setFullScreen()`:
+ * both of those park the compositor's surface at an offset (~26x14 CSS px) while
+ * Electron reports (0,0), which shifts the UI and every click by that amount. An
+ * explicit `setBounds` on the display rectangle lands exactly on the corner.
+ */
+export function resolveWslgFillBounds(
+  display: Pick<Electron.Display, "bounds" | "workArea">,
+): Electron.Rectangle {
+  // workArea is the honest measurement when the compositor reports one smaller
+  // than the display (WSLg subtracts the Windows taskbar); the display rectangle
+  // is the fallback, since Xwayland sometimes reports both as the full panel.
+  const area = display.workArea;
+  const bounds = display.bounds;
+  return area.width < bounds.width || area.height < bounds.height ? area : bounds;
+}
+
 export class DesktopWindow extends Context.Service<
   DesktopWindow,
   {
@@ -137,6 +192,10 @@ export class DesktopWindow extends Context.Service<
     // guest page instead of the app UI. The menu routes here to always target
     // the main window.
     readonly zoomMain: (direction: MainWindowZoomDirection) => Effect.Effect<void>;
+    // Native fullscreen is unreliable under WSLg (see
+    // resolveMainWindowFullscreenAction), so the menu routes here instead of the
+    // Electron `togglefullscreen` role.
+    readonly toggleFullscreen: Effect.Effect<void>;
     readonly syncAppearance: Effect.Effect<void>;
   }
 >()("@t3tools/desktop/window/DesktopWindow") {}
@@ -324,6 +383,20 @@ export const make = Effect.gen(function* () {
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
   const clientSettings = yield* DesktopClientSettings.DesktopClientSettings;
   const electronApp = yield* ElectronApp.ElectronApp;
+  // Bounds to return to when a WSLg fill window is toggled off (see
+  // resolveWslgFillBounds): remembered when the window fills, and seeded from the
+  // restored windowed bounds so leaving the fill always lands on a window that is
+  // not the fill rectangle itself. Null while the window is not filled.
+  let wslgFillRestoreBounds: Electron.Rectangle | null = null;
+  const wslgDefaultRestoreBounds: Electron.Rectangle = {
+    ...DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
+    x: Math.round(
+      (Electron.screen.getPrimaryDisplay().bounds.width - DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE.width) / 2,
+    ),
+    y: Math.round(
+      (Electron.screen.getPrimaryDisplay().bounds.height - DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE.height) / 2,
+    ),
+  };
   const rendererHistory = yield* DesktopRendererHistory.DesktopRendererHistory;
   // Window-side latch for the primary backend's readiness. Set by
   // handleBackendReady (driven by the pool's onReady callback), cleared
@@ -394,11 +467,19 @@ export const make = Effect.gen(function* () {
           }).pipe(Effect.as<readonly Electron.Rectangle[]>([]));
     const initialBounds = resolveInitialMainWindowBounds(persistedBounds, displayBounds);
     const restoredPersistedBounds = persistedBounds !== null && initialBounds === persistedBounds;
+    // WSLg parks the compositor surface off-corner whenever the window manager
+    // maximizes or fullscreens it, so a window restored as "maximized" is created
+    // directly on the display rectangle instead: a window born at the target
+    // rectangle lands exactly on the corner.
+    const wslgFillBounds =
+      persistedSettings.mainWindowMaximized && isWslgSession(process.env)
+        ? resolveWslgFillBounds(Electron.screen.getPrimaryDisplay())
+        : null;
     if (persistedBounds !== null && initialBounds === DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE) {
       yield* logWindowWarning("saved main window bounds could not be restored; using defaults");
     }
     const window = yield* electronWindow.create({
-      ...initialBounds,
+      ...(wslgFillBounds ?? initialBounds),
       minWidth: 840,
       minHeight: 620,
       show: false,
@@ -423,6 +504,11 @@ export const make = Effect.gen(function* () {
       },
     });
 
+    if (wslgFillBounds !== null) {
+      // The window was born filled, so F11's first press must restore the windowed
+      // bounds it would otherwise have had.
+      wslgFillRestoreBounds = persistedBounds ?? null;
+    }
     yield* rendererHistory.register(window.webContents, { surface: "main" });
     if (environment.platform === "darwin") {
       window.setAutoHideCursor(false);
@@ -827,7 +913,7 @@ export const make = Effect.gen(function* () {
       }
       // Reveal the real window, then close the connecting splash (if any) so the
       // two don't overlap and there's no blank gap between them.
-      if (persistedSettings.mainWindowMaximized) {
+      if (persistedSettings.mainWindowMaximized && wslgFillBounds === null) {
         window.maximize();
       }
       void runPromise(Effect.andThen(electronWindow.reveal(window), dismissConnectingSplash));
@@ -1027,6 +1113,50 @@ export const make = Effect.gen(function* () {
       // own zoom, so put each guest back where the preview left it.
       yield* previewManager.reapplyZoom();
     }),
+    toggleFullscreen: Effect.gen(function* () {
+      const window = yield* focusedMainWindow;
+      if (Option.isNone(window) || window.value.isDestroyed()) {
+        return;
+      }
+      const target = window.value;
+      const display = Electron.screen.getDisplayMatching(target.getBounds());
+      const fillBounds = resolveWslgFillBounds(display);
+      const action = resolveMainWindowFullscreenAction({
+        isWslg: isWslgSession(process.env),
+        isFullScreen: target.isFullScreen(),
+        isFilled: isSameWindowBounds(target.getBounds(), fillBounds),
+      });
+      yield* Effect.annotateCurrentSpan({ action });
+      yield* Effect.sync(() => {
+        switch (action) {
+          case "enter-fullscreen":
+            target.setFullScreen(true);
+            return;
+          case "leave-fullscreen":
+            target.setFullScreen(false);
+            return;
+          case "fill": {
+            wslgFillRestoreBounds = target.getBounds();
+            target.setBounds(fillBounds);
+            // The window manager may ignore bounds that exceed the output; fall
+            // back to real fullscreen so F11 always does something visible.
+            setImmediate(() => {
+              if (target.isDestroyed()) return;
+              if (!isSameWindowBounds(target.getBounds(), fillBounds)) {
+                target.setFullScreen(true);
+              }
+            });
+            return;
+          }
+          case "restore": {
+            const restoreBounds = wslgFillRestoreBounds ?? wslgDefaultRestoreBounds;
+            wslgFillRestoreBounds = null;
+            target.setBounds(restoreBounds);
+            return;
+          }
+        }
+      });
+    }).pipe(Effect.withSpan("desktop.window.toggleFullscreen")),
     syncAppearance: Effect.gen(function* () {
       const shouldUseDarkColors = yield* electronTheme.shouldUseDarkColors;
       yield* electronWindow.syncAllAppearance((window) =>
