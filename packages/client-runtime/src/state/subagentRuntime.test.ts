@@ -9,7 +9,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
-import { projectedSubagentsToRuntime } from "./subagentRuntime.ts";
+import { projectedSubagentsToRuntime, settleSubagentsOfTerminalRuns } from "./subagentRuntime.ts";
 import { deriveAgentPanelModel } from "./workflowGroups.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
@@ -184,5 +184,114 @@ describe("projectedSubagentsToRuntime", () => {
       "Recon:done",
       "Design:skipped",
     ]);
+  });
+});
+
+describe("settleSubagentsOfTerminalRuns", () => {
+  const run = (id: string, status: string, completedAt: DateTime.Utc | null = null) => ({
+    id,
+    status,
+    completedAt,
+  });
+  const workflow = (id: string, overrides: Partial<OrchestrationV2Subagent> = {}) =>
+    subagent({
+      id,
+      runId: null,
+      parentNodeId: NodeId.make("node-root"),
+      workflow: {
+        kind: "workflow",
+        workflowName: "subagents 6943d8d3",
+        phases: [],
+        phaseIndex: null,
+        phaseTitle: null,
+        agentIndex: null,
+        runId: "6943d8d3",
+      },
+      ...overrides,
+    });
+
+  it("settles a subagent whose run already completed", () => {
+    const [settled] = settleSubagentsOfTerminalRuns({
+      runs: [run("run-1", "completed", at("2026-09-17T15:00:00.000Z"))],
+      subagents: [subagent({ id: "worker" })],
+    });
+    expect(settled!.status).toBe("completed");
+    expect(settled!.completedAt?.toString()).toBe(at("2026-09-17T15:00:00.000Z").toString());
+  });
+
+  it("settles a workflow coordinator that only links to its parent node", () => {
+    const [settled] = settleSubagentsOfTerminalRuns({
+      runs: [run("run-448", "completed", at("2026-10-22T18:50:16.000Z"))],
+      nodes: [{ id: "node-root", runId: "run-448" }],
+      subagents: [workflow("coordinator")],
+    });
+    expect(settled!.status).toBe("completed");
+  });
+
+  it("settles a member through its coordinator", () => {
+    const settled = settleSubagentsOfTerminalRuns({
+      runs: [run("run-448", "completed")],
+      nodes: [{ id: "node-root", runId: "run-448" }],
+      subagents: [
+        workflow("coordinator"),
+        subagent({
+          id: "member",
+          runId: null,
+          parentNodeId: NodeId.make("coordinator"),
+          status: "running",
+        }),
+      ],
+    });
+    expect(settled.map((entry) => entry.status)).toEqual(["completed", "completed"]);
+  });
+
+  it("leaves a live run's subagents alone", () => {
+    const [settled] = settleSubagentsOfTerminalRuns({
+      runs: [run("run-1", "running")],
+      subagents: [subagent({ id: "worker" })],
+    });
+    expect(settled!.status).toBe("running");
+    expect(settled!.completedAt).toBeNull();
+  });
+
+  it("leaves a delegated subagent alone: its child thread outlives the run", () => {
+    const [settled] = settleSubagentsOfTerminalRuns({
+      runs: [run("run-1", "completed")],
+      subagents: [subagent({ id: "delegated", childThreadId: ThreadId.make("thread-child") })],
+    });
+    expect(settled!.status).toBe("running");
+  });
+
+  it("carries the run's failure onto its subagents", () => {
+    const [settled] = settleSubagentsOfTerminalRuns({
+      runs: [run("run-1", "failed")],
+      subagents: [subagent({ id: "worker" })],
+    });
+    expect(settled!.status).toBe("failed");
+  });
+
+  it("leaves terminal subagents untouched", () => {
+    const completed = subagent({
+      id: "done",
+      status: "completed",
+      completedAt: at("2026-09-17T14:47:00.000Z"),
+    });
+    const [settled] = settleSubagentsOfTerminalRuns({
+      runs: [run("run-1", "completed")],
+      subagents: [completed],
+    });
+    expect(settled!.status).toBe("completed");
+    expect(settled!.completedAt?.toString()).toBe(at("2026-09-17T14:47:00.000Z").toString());
+  });
+
+  it("does not loop on a cyclic parent chain", () => {
+    const settled = settleSubagentsOfTerminalRuns({
+      runs: [run("run-1", "completed")],
+      subagents: [
+        subagent({ id: "a", runId: null, parentNodeId: NodeId.make("b") }),
+        subagent({ id: "b", runId: null, parentNodeId: NodeId.make("a") }),
+      ],
+    });
+    expect(settled.map((entry) => entry.status)).toEqual(["running", "running"]);
   });
 });
