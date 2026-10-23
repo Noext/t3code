@@ -1073,6 +1073,51 @@ describe("DesktopWindow", () => {
     }),
   );
 
+  it.effect("persists a WSLg fill window as maximized with its windowed rectangle", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      // Window fills the compositor work area: not "maximized" to the WM.
+      fakeWindow.getBounds.mockReturnValue({ x: 0, y: 0, width: 1920, height: 1040 });
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const mainWindowBoundsUpdates: DesktopAppSettings.DesktopWindowBounds[] = [];
+      const mainWindowMaximizedUpdates: boolean[] = [];
+      const layer = layerTest({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+        mainWindowBoundsUpdates,
+        mainWindowMaximizedUpdates,
+      });
+
+      yield* Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+          vi.stubEnv("WSL_DISTRO_NAME", "Ubuntu");
+        });
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+
+        const close = fakeWindow.windowListeners.get("close");
+        if (!close) {
+          return yield* Effect.die("window close listener was not registered");
+        }
+        close();
+        yield* Effect.promise(() => Promise.resolve());
+
+        // The fill rectangle is not what gets restored: the windowed size is, and
+        // the filled state is remembered as maximized so the next launch fills.
+        assert.deepEqual(mainWindowBoundsUpdates, [
+          { x: 0, y: 0, width: 1920, height: 1040 },
+        ]);
+        assert.deepEqual(mainWindowMaximizedUpdates, [true]);
+      }).pipe(
+        Effect.provide(layer),
+        Effect.ensuring(Effect.sync(() => vi.unstubAllEnvs())),
+      );
+    }),
+  );
+
   it.effect("persists normal bounds and state from the native maximize event", () =>
     Effect.gen(function* () {
       const fakeWindow = makeFakeBrowserWindow();

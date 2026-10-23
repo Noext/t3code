@@ -516,33 +516,55 @@ export const make = Effect.gen(function* () {
     let boundsPersistFiber: Fiber.Fiber<void, never> | undefined;
     let pendingBoundsPersistFiber: Fiber.Fiber<void, never> | undefined;
     let boundsPersistenceEnabled = persistedBounds === null || restoredPersistedBounds;
-    const readPersistableBounds = (): DesktopAppSettings.DesktopWindowBounds | null => {
-      if (window.isDestroyed()) {
-        return null;
-      }
-      const bounds =
-        window.isFullScreen() || window.isMaximized() || window.isMinimized()
-          ? window.getNormalBounds()
-          : window.getBounds();
-      return DesktopAppSettings.normalizeMainWindowBounds({
+    // A WSLg fill window is not "maximized" as far as the window manager is
+    // concerned, so its state has to be persisted explicitly or the next launch
+    // forgets the filled state and opens windowed.
+    const normalizeBounds = (
+      bounds: Pick<Electron.Rectangle, "x" | "y" | "width" | "height">,
+    ): DesktopAppSettings.DesktopWindowBounds | null =>
+      DesktopAppSettings.normalizeMainWindowBounds({
         x: Math.round(bounds.x),
         y: Math.round(bounds.y),
         width: Math.round(bounds.width),
         height: Math.round(bounds.height),
       });
+    const readPersistableState = (): {
+      readonly bounds: DesktopAppSettings.DesktopWindowBounds;
+      readonly filled: boolean;
+    } | null => {
+      if (window.isDestroyed()) {
+        return null;
+      }
+      if (window.isFullScreen() || window.isMaximized() || window.isMinimized()) {
+        const normal = normalizeBounds(window.getNormalBounds());
+        return normal === null ? null : { bounds: normal, filled: false };
+      }
+      const current = window.getBounds();
+      const filled =
+        isWslgSession(process.env) &&
+        isSameWindowBounds(
+          current,
+          resolveWslgFillBounds(Electron.screen.getDisplayMatching(current)),
+        );
+      // Filled windows persist the windowed rectangle they would return to, not
+      // the display rectangle, so a later restore still has a size to fall back on.
+      const normalized = normalizeBounds(filled ? (wslgFillRestoreBounds ?? current) : current);
+      return normalized === null ? null : { bounds: normalized, filled };
     };
+    const readPersistableBounds = (): DesktopAppSettings.DesktopWindowBounds | null =>
+      readPersistableState()?.bounds ?? null;
     const fallbackWindowBounds = boundsPersistenceEnabled ? null : readPersistableBounds();
     const fallbackWindowMaximized = persistedSettings.mainWindowMaximized;
     const persistCurrentBounds = (): Fiber.Fiber<void, never> | undefined => {
       if (!boundsPersistenceEnabled) {
         return pendingBoundsPersistFiber;
       }
-      const bounds = readPersistableBounds();
-      if (bounds === null) {
+      const state = readPersistableState();
+      if (state === null) {
         return pendingBoundsPersistFiber;
       }
       pendingBoundsPersistFiber = runFork(
-        desktopSettings.setMainWindowBounds(bounds, window.isMaximized()).pipe(
+        desktopSettings.setMainWindowBounds(state.bounds, window.isMaximized() || state.filled).pipe(
           Effect.asVoid,
           Effect.catch((error) =>
             logWindowWarning("failed to persist main window bounds", {
