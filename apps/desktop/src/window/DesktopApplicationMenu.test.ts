@@ -87,6 +87,7 @@ const layerDesktopWindow = (selectedAction: Deferred.Deferred<string>) =>
     dispatchSnapShotEvent: () => Effect.void,
     zoomMain: (direction) =>
       Deferred.succeed(selectedAction, `zoom-${direction}`).pipe(Effect.asVoid),
+    toggleFullscreen: Deferred.succeed(selectedAction, "toggle-fullscreen").pipe(Effect.asVoid),
     syncAppearance: Effect.void,
   } satisfies DesktopWindow.DesktopWindow["Service"]);
 

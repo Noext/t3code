@@ -30,8 +30,17 @@ vi.mock("electron", async (importOriginal) => ({
     getAllDisplays: vi.fn(() => [
       {
         bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+        workArea: { x: 0, y: 0, width: 1920, height: 1040 },
       },
     ]),
+    getPrimaryDisplay: vi.fn(() => ({
+      bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+    })),
+    getDisplayMatching: vi.fn(() => ({
+      bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+    })),
   },
 }));
 
@@ -117,6 +126,7 @@ function makeFakeBrowserWindow() {
     restore: vi.fn(),
     setBackgroundColor: vi.fn(),
     setAutoHideCursor: vi.fn(),
+    setBounds: vi.fn(),
     setFullScreen: vi.fn(),
     setOpacity: vi.fn(),
     setTitle: vi.fn(),
@@ -136,6 +146,7 @@ function makeFakeBrowserWindow() {
     isMinimized: window.isMinimized,
     loadURL: window.loadURL,
     maximize: window.maximize,
+    setBounds: window.setBounds,
     openDevTools: webContents.openDevTools,
     reload: webContents.reload,
     send: webContents.send,
@@ -442,6 +453,50 @@ const captureOne = DesktopSnapShotId.make("11111111-1111-4111-8111-111111111111"
 const captureTwo = DesktopSnapShotId.make("22222222-2222-4222-8222-222222222222");
 
 describe("DesktopWindow", () => {
+  it.effect("creates a restored WSLg window already filling the display", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const createdWindowOptions: Electron.BrowserWindowConstructorOptions[] = [];
+      const layer = layerTest({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+        createdWindowOptions,
+        desktopSettings: {
+          ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+          mainWindowBounds: { x: 120, y: 80, width: 1320, height: 880 },
+          mainWindowMaximized: true,
+        },
+      });
+
+      yield* Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+          vi.stubEnv("WSL_DISTRO_NAME", "Ubuntu");
+        });
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        const readyToShow = fakeWindow.windowListeners.get("ready-to-show");
+        if (!readyToShow) {
+          return yield* Effect.die("window ready-to-show listener was not registered");
+        }
+        readyToShow();
+        // Created straight on the compositor's work area: no maximize(), whose
+        // state transition parks the surface off-corner.
+        assert.equal(fakeWindow.maximize.mock.calls.length, 0);
+        assert.equal(createdWindowOptions[0]?.x, 0);
+        assert.equal(createdWindowOptions[0]?.y, 0);
+        assert.equal(createdWindowOptions[0]?.width, 1920);
+        assert.equal(createdWindowOptions[0]?.height, 1040);
+      }).pipe(
+        Effect.provide(layer),
+        Effect.ensuring(Effect.sync(() => vi.unstubAllEnvs())),
+      );
+    }),
+  );
+
   it.effect("shows native context menus for browser guests and sign-in popups", () =>
     Effect.gen(function* () {
       const host = makeFakeBrowserWindow();
@@ -589,6 +644,35 @@ describe("DesktopWindow", () => {
     assert.deepEqual(
       DesktopWindow.resolveInitialMainWindowBounds(persistedBounds, [displays[0]!]),
       DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
+    );
+  });
+
+  it.each([
+    { label: "native fullscreen", isWslg: false, isFullScreen: false, isFilled: false, expected: "enter-fullscreen" },
+    { label: "leaving native fullscreen", isWslg: false, isFullScreen: true, isFilled: false, expected: "leave-fullscreen" },
+    { label: "a WSLg window that is already fullscreen", isWslg: true, isFullScreen: true, isFilled: true, expected: "leave-fullscreen" },
+    { label: "filling a WSLg window", isWslg: true, isFullScreen: false, isFilled: false, expected: "fill" },
+    { label: "restoring a filled WSLg window", isWslg: true, isFullScreen: false, isFilled: true, expected: "restore" },
+  ])("resolves the fullscreen toggle for $label", ({ isWslg, isFullScreen, isFilled, expected }) => {
+    assert.equal(
+      DesktopWindow.resolveMainWindowFullscreenAction({ isWslg, isFullScreen, isFilled }),
+      expected,
+    );
+  });
+
+  it("fills a WSLg window to the compositor's own work area", () => {
+    const display = {
+      bounds: { x: 0, y: 0, width: 2560, height: 1440 },
+      workArea: { x: 0, y: 0, width: 2560, height: 1380 },
+    };
+
+    assert.deepEqual(DesktopWindow.resolveWslgFillBounds(display), display.workArea);
+    assert.deepEqual(
+      DesktopWindow.resolveWslgFillBounds({
+        bounds: display.bounds,
+        workArea: display.bounds,
+      }),
+      display.bounds,
     );
   });
 
@@ -861,6 +945,11 @@ describe("DesktopWindow", () => {
       });
 
       yield* Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          vi.stubEnv("WAYLAND_DISPLAY", "");
+          vi.stubEnv("WSL_DISTRO_NAME", "");
+          vi.stubEnv("WSL_INTEROP", "");
+        });
         const desktopWindow = yield* DesktopWindow.DesktopWindow;
         yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
 
@@ -871,7 +960,11 @@ describe("DesktopWindow", () => {
         }
         readyToShow();
         assert.equal(fakeWindow.maximize.mock.calls.length, 1);
-      }).pipe(Effect.provide(layer));
+        assert.equal(fakeWindow.setBounds.mock.calls.length, 0);
+      }).pipe(
+        Effect.provide(layer),
+        Effect.ensuring(Effect.sync(() => vi.unstubAllEnvs())),
+      );
     }),
   );
 

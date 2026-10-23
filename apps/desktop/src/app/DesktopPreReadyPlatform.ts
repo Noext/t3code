@@ -31,6 +31,42 @@ function readCommandLineSwitchValue(
   return value.length > 0 ? value : null;
 }
 
+export const WSLG_SCALE_FACTOR_ENV = "T3CODE_DESKTOP_SCALE_FACTOR";
+
+/**
+ * WSLg is the only Linux session where the compositor's real output is smaller
+ * than the X screen Xwayland reports: the RDP surface is the Windows work area
+ * (the taskbar is excluded) while Xwayland keeps advertising the full panel.
+ */
+export function isWslgSession(env: Readonly<Record<string, string | undefined>>): boolean {
+  return (
+    (env.WAYLAND_DISPLAY?.trim() ?? "").length > 0 &&
+    ((env.WSL_DISTRO_NAME?.trim() ?? "").length > 0 ||
+      (env.WSL_INTEROP?.trim() ?? "").length > 0)
+  );
+}
+
+/**
+ * Chromium derives no device scale factor from WSLg: Xwayland advertises the host
+ * panel in physical pixels while the compositor draws the RDP surface in the
+ * host's scaled logical space, so a 125% Windows display yields a 2560x1440
+ * surface rendered with `devicePixelRatio: 1`. The UI comes out 20% smaller than
+ * native, which makes click targets feel offset. Pinning the scale factor restores
+ * native sizing. Opt-in through the env var because only the user knows their host
+ * scale, and a wrong guess would oversize the UI.
+ */
+export function resolveWslgDeviceScaleFactor(input: {
+  readonly platform: string;
+  readonly env: Readonly<Record<string, string | undefined>>;
+  readonly hasSwitch: (switchName: string) => boolean;
+}): string | null {
+  if (input.platform !== "linux") return null;
+  if (!isWslgSession(input.env) || input.hasSwitch("force-device-scale-factor")) return null;
+  const requested = Number(input.env[WSLG_SCALE_FACTOR_ENV]?.trim() ?? "");
+  if (!Number.isFinite(requested) || requested <= 0 || requested > 4) return null;
+  return String(requested);
+}
+
 export const resolveEarlyLinuxElectronOptionsFromProcess =
   (): DesktopEarlyElectronStartup.EarlyLinuxElectronOptions =>
     DesktopEarlyElectronStartup.resolveEarlyLinuxElectronOptions({
@@ -112,6 +148,14 @@ export const make = Effect.gen(function* () {
       Electron.app.commandLine.appendSwitch("class", linux.linuxWmClass);
       if (linux.passwordStore !== null && linuxPasswordStoreCommandLine === null) {
         Electron.app.commandLine.appendSwitch("password-store", linux.passwordStore);
+      }
+      const wslgScaleFactor = resolveWslgDeviceScaleFactor({
+        platform,
+        env: process.env,
+        hasSwitch: (switchName) => Electron.app.commandLine.hasSwitch(switchName),
+      });
+      if (wslgScaleFactor !== null) {
+        Electron.app.commandLine.appendSwitch("force-device-scale-factor", wslgScaleFactor);
       }
     }
 

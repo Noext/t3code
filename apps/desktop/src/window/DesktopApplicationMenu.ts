@@ -58,6 +58,15 @@ const zoomMainWindow = Effect.fn("desktop.menu.zoomMainWindow")(function* (
   yield* desktopWindow.zoomMain(direction);
 });
 
+const toggleMainWindowFullscreen = Effect.fn("desktop.menu.toggleFullscreen")(function* (): Effect.fn.Return<
+  void,
+  never,
+  DesktopWindow.DesktopWindow
+> {
+  const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  yield* desktopWindow.toggleFullscreen;
+});
+
 const checkForUpdatesFromMenu = Effect.gen(function* () {
   const updates = yield* DesktopUpdates.DesktopUpdates;
   const electronDialog = yield* ElectronDialog.ElectronDialog;
@@ -152,6 +161,9 @@ export const make = Effect.gen(function* () {
     };
     const zoomClick = (direction: DesktopWindow.MainWindowZoomDirection) => () => {
       runMenuEffect(`zoom-${direction}`, zoomMainWindow(direction));
+    };
+    const toggleFullscreenClick = () => {
+      runMenuEffect("toggle-fullscreen", toggleMainWindowFullscreen());
     };
     const template: Electron.MenuItemConstructorOptions[] = [];
 
@@ -250,7 +262,11 @@ export const make = Effect.gen(function* () {
           },
           { label: "Zoom Out", accelerator: "CmdOrCtrl+-", click: zoomClick("out") },
           { type: "separator" },
-          { role: "togglefullscreen" },
+          {
+            label: "Toggle Full Screen",
+            accelerator: environment.platform === "darwin" ? "Ctrl+Cmd+F" : "F11",
+            click: toggleFullscreenClick,
+          },
         ],
       },
       { role: "windowMenu" },

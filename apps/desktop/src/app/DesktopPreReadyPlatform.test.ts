@@ -128,6 +128,105 @@ describe("DesktopPreReadyPlatform", () => {
     ).pipe(Effect.ensuring(Effect.sync(() => vi.unstubAllEnvs())));
   });
 
+  it.each([
+    {
+      label: "linux WSLg with an explicit scale",
+      input: { platform: "linux", env: { WAYLAND_DISPLAY: "wayland-0", WSL_DISTRO_NAME: "Ubuntu" } },
+      expected: "1.25",
+    },
+    {
+      label: "linux WSLg detected through WSL_INTEROP",
+      input: {
+        platform: "linux",
+        env: { WAYLAND_DISPLAY: "wayland-0", WSL_INTEROP: "/run/WSL/1_interop" },
+      },
+      expected: "1.25",
+    },
+    {
+      label: "macOS",
+      input: {
+        platform: "darwin",
+        env: { WAYLAND_DISPLAY: "wayland-0", WSL_DISTRO_NAME: "Ubuntu" },
+      },
+      expected: null,
+    },
+    {
+      label: "X11 session inside WSL",
+      input: { platform: "linux", env: { WSL_DISTRO_NAME: "Ubuntu" } },
+      expected: null,
+    },
+    {
+      label: "native Linux Wayland",
+      input: { platform: "linux", env: { WAYLAND_DISPLAY: "wayland-0" } },
+      expected: null,
+    },
+    {
+      label: "an unusable requested scale",
+      input: {
+        platform: "linux",
+        env: {
+          WAYLAND_DISPLAY: "wayland-0",
+          WSL_DISTRO_NAME: "Ubuntu",
+          T3CODE_DESKTOP_SCALE_FACTOR: "0",
+        },
+      },
+      expected: null,
+    },
+    {
+      label: "an explicit user scale overriding the default",
+      input: {
+        platform: "linux",
+        env: {
+          WAYLAND_DISPLAY: "wayland-0",
+          WSL_DISTRO_NAME: "Ubuntu",
+          T3CODE_DESKTOP_SCALE_FACTOR: "1.5",
+        },
+      },
+      expected: "1.5",
+    },
+  ])("resolves the WSLg device scale factor for $label", ({ input, expected }) => {
+    assert.equal(
+      DesktopPreReadyPlatform.resolveWslgDeviceScaleFactor({
+        ...input,
+        env: { T3CODE_DESKTOP_SCALE_FACTOR: "1.25", ...input.env },
+        hasSwitch: () => false,
+      }),
+      expected,
+    );
+  });
+
+  it("leaves an explicit force-device-scale-factor switch alone", () => {
+    assert.isNull(
+      DesktopPreReadyPlatform.resolveWslgDeviceScaleFactor({
+        platform: "linux",
+        env: { WAYLAND_DISPLAY: "wayland-0", WSL_DISTRO_NAME: "Ubuntu" },
+        hasSwitch: (switchName) => switchName === "force-device-scale-factor",
+      }),
+    );
+  });
+
+  it.effect("pins the WSLg scale factor before Electron reads the command line", () => {
+    vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+    vi.stubEnv("WSL_DISTRO_NAME", "Ubuntu");
+    vi.stubEnv("T3CODE_DESKTOP_SCALE_FACTOR", "1.25");
+    getSwitchValueMock.mockReturnValue("");
+    hasSwitchMock.mockReturnValue(false);
+
+    return DesktopPreReadyPlatform.make.pipe(
+      Effect.provideService(HostProcessPlatform, "linux"),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const scaleCall = appendSwitchMock.mock.calls.find(
+            ([name]) => name === "force-device-scale-factor",
+          );
+          assert.deepEqual(scaleCall, ["force-device-scale-factor", "1.25"]);
+        }),
+      ),
+      Effect.asVoid,
+      Effect.ensuring(Effect.sync(() => vi.unstubAllEnvs())),
+    );
+  });
+
   it.effect("keeps startup available when the early desktop entry cannot be written", () => {
     getSwitchValueMock.mockReturnValue("");
     mkdirSyncMock.mockImplementation(() => {

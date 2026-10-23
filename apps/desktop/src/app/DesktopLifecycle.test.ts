@@ -96,6 +96,7 @@ function layerDesktopWindow(
     dispatchMenuAction: () => Effect.void,
     dispatchSnapShotEvent: () => Effect.void,
     zoomMain: () => Effect.void,
+    toggleFullscreen: Effect.void,
     syncAppearance: Effect.void,
   });
 }
