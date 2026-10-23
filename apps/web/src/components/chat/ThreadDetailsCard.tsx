@@ -89,10 +89,13 @@ export function ThreadDetailsCard({
     const measure = () => {
       const frame = element.closest<HTMLElement>("[data-thread-details-card]");
       const next = element.offsetHeight + (frame ? frame.offsetHeight - frame.clientHeight : 0);
-      // Lineage scrolls as it expands. Counting it toward density would hide
-      // the section and workspace controls when the user asks to see more rows.
-      const lineage = element.querySelector<HTMLElement>("[data-thread-relationships-panel]");
-      const fittingHeight = next - (lineage?.offsetHeight ?? 0);
+      // Lineage and workflows scroll as they expand. Counting them toward density
+      // would hide the section and workspace controls when the user asks to see
+      // more rows, or to open a workflow's agents.
+      const folding = ["[data-thread-relationships-panel]", "[data-thread-workflows-panel]"]
+        .map((selector) => element.querySelector<HTMLElement>(selector)?.offsetHeight ?? 0)
+        .reduce((total, height) => total + height, 0);
+      const fittingHeight = next - folding;
       setMeasurements((current) => {
         const heights = current.key === measurementKey ? current.heights : { full: 0, compact: 0 };
         const fullContentHeight =

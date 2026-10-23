@@ -82,7 +82,24 @@ The most common defect in this repo is a change that works on the path you teste
 - Ports derive from the worktree path and are stable across restarts, but read the real ones from the `[dev-runner]` line since occupied ports shift.
 - Sharing over the tailnet is three steps: run `vp run dev --share` in the background, wait for the `pairingUrl:` line in its output, then give that full URL to an unpaired browser. Do not wire up `tailscale serve` by hand, open the URL yourself, or consume the user's pairing link. A browser with the reusable dev cookie can use the bare origin. If a normal one-time token was consumed, mint a fresh one with `node apps/server/src/bin.ts pair`. It carries standard scopes, while the startup URL carries admin scopes needed for Connections settings.
 - To reuse web dev auth across worktrees, configure one fixed `T3CODE_DEV_AUTH_TOKEN` in the main checkout's gitignored `.env`. The `t3.json` setup links that file into worktrees. Never commit or publish the token or a startup URL. See [Reusable dev credential](docs/operations/development.md#reusable-dev-credential).
+- A worktree with no `.env` is broken, not merely unconfigured, so before anything else run the setup from the worktree root: `T3CODE_PROJECT_ROOT=<main checkout> node scripts/setup-worktree.ts`. Worktrees T3 Code creates run it through `runOnWorktreeCreate` and fail loudly when `.env` is missing, so this is the repair for a worktree you made by hand, not the normal path.
 - Stop what you started, by the PID you tracked. See rule 1.
+
+## Building the app for real
+
+Dev mode serves `apps/web/src` through Vite, so a UI change needs no build at all. Every other run is different: the desktop shell spawns `apps/server/dist/bin.mjs`, and that server serves **its own copy of the built web app**, not the source and not freshly whatever you just built.
+
+- `vp run build` (the root `build` script) is `vp run --filter './apps/*' build`. It builds the apps that have a `build` script: web into `apps/web/dist`, server into `apps/server/dist`, marketing. It does not build the Electron main, and it does not refresh the client copy the server serves.
+- The served static dir is resolved by `resolveStaticDir` in `apps/server/src/config.ts`: `<directory of the server bundle>/client` when that `index.html` exists, otherwise `../../web/dist`. A stale `apps/server/dist/client` therefore shadows a fresh `apps/web/dist`, silently and indefinitely.
+- To see a web change in a built run, refresh the copy after building: `rsync -a --delete apps/web/dist/ apps/server/dist/client/`. Deleting `apps/server/dist/client` instead works too, by letting it fall back to `apps/web/dist`.
+- Only the artifact pipelines populate `dist/client` themselves — `vp run dist:desktop:artifact`, and `apps/server/scripts/cli.ts` for the exe build — and they apply brand-asset overrides while doing it. Never hand-edit that directory for anything else.
+- Changing `apps/desktop/src` additionally needs the Electron main rebuilt (`vp run build:desktop`, or `dev:desktop`); rebuilding web and server does not touch `dist-electron/main.cjs`.
+- Before debugging a fix that "did not work", prove which bundle you are looking at:
+  ```sh
+  curl -s http://127.0.0.1:<port>/ | grep -o '/assets/index-[^"]*\.js'   # served
+  ls apps/web/dist/assets/index-*.js                                      # built
+  ```
+  A different hash means you are testing old code, and no amount of reading the diff will explain it.
 
 ## Test data
 

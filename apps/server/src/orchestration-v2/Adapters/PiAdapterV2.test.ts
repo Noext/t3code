@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -40,8 +41,9 @@ import {
   type ProviderAdapterV2Event,
   type ProviderAdapterV2SessionRuntime,
 } from "../ProviderAdapter.ts";
+import * as ProviderContinuationRequests from "../ProviderContinuationRequests.ts";
 import { handoffBudget } from "../ContextHandoffBudget.ts";
-import { makePiAdapterV2, PI_PROVIDER } from "./PiAdapterV2.ts";
+import { makePiAdapterV2, PI_PROVIDER, type PiContinuationRequests } from "./PiAdapterV2.ts";
 import { makePiRpcConnection, type PiRpcRecord } from "./PiRpc.ts";
 import { piWorkflowProjectKey } from "./PiWorkflowStore.ts";
 
@@ -58,6 +60,8 @@ const PI_INSTANCE_ID = ProviderInstanceId.make("pi");
 const THREAD_ID = ThreadId.make("thread-pi-test");
 const SESSION_ID = ProviderSessionId.make("provider-session-pi-test");
 const FAKE_SESSION_FILE = "/fake/.pi/agent/sessions/--workspace--/0001_abc.jsonl";
+/** The orchestrator's marker text for a run that only ingests an adapter wake. */
+const CONTINUATION_MARKER = "Background task completed.";
 /** Deliberately outside the valid pid range so a group-kill can never land. */
 const FAKE_PID = 999_999_999;
 
@@ -323,10 +327,18 @@ const makeAdapter = Effect.fnUntraced(function* (
   launchArgs = "",
   forkFake?: FakePi,
   workflow?: PiWorkflowTestOptions,
+  continuationRequests?: PiContinuationRequests | null,
 ) {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;
+  // The live runtime hands each provider instance the queue its continuation
+  // worker drains, so the adapter captures it when it is created. `null`
+  // simulates a caller that wires no worker at all.
+  const continuations =
+    continuationRequests === undefined
+      ? yield* ProviderContinuationRequests.ProviderContinuationRequests
+      : (continuationRequests ?? undefined);
   return makePiAdapterV2({
     instanceId: PI_INSTANCE_ID,
     settings: { enabled: true, binaryPath: "pi", launchArgs, customModels: [] },
@@ -342,6 +354,7 @@ const makeAdapter = Effect.fnUntraced(function* (
     fileSystem,
     idAllocator,
     serverConfig,
+    ...(continuations === undefined ? {} : { continuationRequests: continuations }),
     ...(workflow === undefined
       ? {}
       : {
@@ -359,8 +372,9 @@ const openRuntime = Effect.fnUntraced(function* (
   providerSessionId = SESSION_ID,
   forkFake?: FakePi,
   workflow?: PiWorkflowTestOptions,
+  continuationRequests?: PiContinuationRequests | null,
 ) {
-  const adapter = yield* makeAdapter(fake, "", forkFake, workflow);
+  const adapter = yield* makeAdapter(fake, "", forkFake, workflow, continuationRequests);
   const runtime = yield* adapter.openSession({
     threadId,
     providerSessionId,
@@ -418,6 +432,7 @@ const startTurn = Effect.fnUntraced(function* (
   selection?: ModelSelection,
   runOrdinal = 1,
   threadId = THREAD_ID,
+  continuation = false,
 ) {
   const appThread = yield* makeAppThread(model, threadId);
   const runId = RunId.make(`run:${threadId}:${runOrdinal}`);
@@ -434,8 +449,10 @@ const startTurn = Effect.fnUntraced(function* (
       messageId: `message:${threadId}:${runOrdinal}` as never,
       text,
       attachments,
-      createdBy: "user",
-      creationSource: "web",
+      // A continuation message is the orchestrator's marker for the run that
+      // ingests an extension wake, never a prompt for Pi.
+      createdBy: continuation ? "agent" : "user",
+      creationSource: continuation ? "provider" : "web",
     },
     modelSelection: selection ?? modelSelection(model),
     runtimePolicy,
@@ -491,16 +508,99 @@ describe("PiAdapterV2", () => {
         modelSelection: modelSelection("default"),
         runtimePolicy,
       });
+      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
 
       yield* fake.emit({ type: "agent_start" });
+      const offer = yield* requests.take;
+      // The thread was archived before the continuation could be dispatched, so
+      // no run will ever ingest the turn Pi started on its own.
+      yield* offer.clearIfCurrent!();
+      assert.isFalse(
+        fake.allRequests().some((request) => request["type"] === "abort"),
+        "a wake nothing can own stops the runtime rather than aborting its turn",
+      );
 
-      const sessionError = yield* takeEvent(
+      // A provider stop, not a stream failure: the run that would have owned
+      // the turn no longer exists, so clients must not report an internal
+      // event-stream error for it.
+      const sessionStopped = yield* takeEvent(
         (event) =>
-          event.type === "provider_session.updated" && event.providerSession.status === "error",
+          event.type === "provider_session.updated" && event.providerSession.status === "stopped",
       );
       assert.isTrue(
-        sessionError.type === "provider_session.updated" &&
-          sessionError.providerSession.lastError?.includes("invisible tool execution") === true,
+        sessionStopped.type === "provider_session.updated" &&
+          sessionStopped.providerSession.lastError?.includes("invisible tool execution") === true,
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerTest),
+      Effect.provide(ProviderContinuationRequests.layer),
+    ),
+  );
+
+  it.effect("stops a wake whose continuation offer is never taken", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const offered = yield* Deferred.make<void>();
+      const { runtime, takeEvent } = yield* openRuntime(
+        fake,
+        "default",
+        THREAD_ID,
+        SESSION_ID,
+        undefined,
+        undefined,
+        // Nothing drains offers, as in a runtime whose continuation worker is
+        // missing.
+        { offer: () => Deferred.succeed(offered, void 0).pipe(Effect.asVoid) },
+      );
+      yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.emit({ type: "agent_start" });
+      yield* Deferred.await(offered);
+      // Holding the turn forever would hide its work, so an offer nothing ever
+      // takes ends as a provider stop instead. The second advance releases the
+      // deadline even if the first one landed before it registered.
+      yield* TestClock.adjust(Duration.seconds(61));
+      yield* TestClock.adjust(Duration.seconds(61));
+      const sessionStopped = yield* takeEvent(
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "stopped",
+      );
+      assert.isTrue(
+        sessionStopped.type === "provider_session.updated" &&
+          sessionStopped.providerSession.lastError?.includes("invisible tool execution") === true,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("stops a wake when its caller wired no continuation service", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(
+        fake,
+        "default",
+        THREAD_ID,
+        SESSION_ID,
+        undefined,
+        undefined,
+        null,
+      );
+      yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.emit({ type: "agent_start" });
+      const sessionStopped = yield* takeEvent(
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "stopped",
+      );
+      assert.isTrue(
+        sessionStopped.type === "provider_session.updated" &&
+          sessionStopped.providerSession.lastError?.includes("invisible tool execution") === true,
       );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
@@ -2539,6 +2639,99 @@ describe("PiAdapterV2", () => {
       const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
       assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("holds a provider-initiated turn and replays it into the continuation run", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      // pi-subagents resumes the parent session by itself once a fan-out ends.
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+      yield* fake.emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "fan-out done" },
+      });
+      const offer = yield* requests.take;
+      assert.equal(offer.driver, PI_PROVIDER);
+      assert.equal(offer.threadId, THREAD_ID);
+      assert.equal(offer.providerThreadId, providerThread.id);
+      // Adapter-buffered: the dispatched message only triggers ingestion.
+      assert.isUndefined(offer.delivery);
+      yield* fake.emit({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          stopReason: "endTurn",
+          content: [{ type: "text", text: "fan-out done" }],
+        },
+      });
+      yield* fake.emit({ type: "agent_settled" });
+      // The continuation run ingests the held records instead of prompting Pi.
+      yield* startTurn(
+        runtime,
+        providerThread,
+        "default",
+        [],
+        CONTINUATION_MARKER,
+        undefined,
+        2,
+        THREAD_ID,
+        true,
+      );
+      assert.isFalse(
+        fake.allRequests().some((request) => request["type"] === "prompt"),
+        "the continuation marker is not a prompt",
+      );
+      const item = yield* takeEvent(
+        (event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message",
+      );
+      assert.isTrue(
+        item.type === "turn_item.updated" &&
+          item.turnItem.type === "assistant_message" &&
+          item.turnItem.text.includes("fan-out done"),
+      );
+      yield* fake.takeRequest("get_state");
+      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerTest),
+      Effect.provide(ProviderContinuationRequests.layer),
+    ),
+  );
+
+  it.effect("aborts the unowned turn when a user turn takes the session", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      yield* fake.emit({ type: "agent_start" });
+      yield* requests.take;
+      yield* startTurn(runtime, providerThread);
+      const prompt = yield* fake.takeRequest("prompt");
+      assert.equal(prompt["message"], "Hello pi");
+      assert.isTrue(
+        fake.allRequests().some((request) => request["type"] === "abort"),
+        "the unowned turn is cancelled before the user prompt",
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerTest),
+      Effect.provide(ProviderContinuationRequests.layer),
+    ),
   );
 });
 
