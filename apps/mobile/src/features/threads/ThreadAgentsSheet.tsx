@@ -1,5 +1,8 @@
 import { useAtomValue } from "@effect/atom-react";
-import { projectedSubagentsToRuntime } from "@t3tools/client-runtime/state/subagentRuntime";
+import {
+  projectedSubagentsToRuntime,
+  settleSubagentsOfTerminalRuns,
+} from "@t3tools/client-runtime/state/subagentRuntime";
 import type { ThreadTurnSubagents } from "@t3tools/client-runtime/state/thread-subagents";
 import {
   deriveAgentPanelModel,
@@ -47,20 +50,33 @@ export function useThreadAgentPanel(target: AgentsTarget): ThreadAgentPanel {
   // turn roster: workflow rows carry the `workflow` block and
   // `deriveThreadTurnSubagents` leaves them out. Direct spawns are scoped to
   // the current turn instead, so an old turn's rows never resurface.
-  const subagents = useAtomValue(
+  const projection = useAtomValue(
     environmentThreadDetails.threadAtom(target),
-    (thread) => thread?.projection.subagents,
+    (thread) => thread?.projection,
   );
-  return useMemo(() => {
-    const roster = subagents ?? [];
-    return {
+  // Same normalization as the web panel: a subagent whose provider never
+  // reported its end stays `running` after its run is terminal.
+  const roster = useMemo(
+    () =>
+      projection === undefined
+        ? []
+        : settleSubagentsOfTerminalRuns({
+            runs: projection.runs,
+            nodes: projection.nodes,
+            subagents: projection.subagents,
+          }),
+    [projection],
+  );
+  return useMemo(
+    () => ({
       model: deriveAgentPanelModel(
         projectedSubagentsToRuntime(roster),
         projectedSubagentsToRuntime(turn?.subagents ?? []),
       ),
       subagentById: new Map(roster.map((subagent) => [subagent.id, subagent])),
-    };
-  }, [subagents, turn]);
+    }),
+    [roster, turn],
+  );
 }
 
 export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {

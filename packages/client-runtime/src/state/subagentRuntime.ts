@@ -91,6 +91,84 @@ export function isActiveSubagentStatus(status: RuntimeSubagentStatus): boolean {
   return isOrchestrationV2WorkActive(status);
 }
 
+/** Active run states are the only ones that can still emit subagent events. */
+const TERMINAL_RUN_STATUSES = new Map<string, OrchestrationV2Subagent["status"]>([
+  ["completed", "completed"],
+  ["failed", "failed"],
+  ["cancelled", "cancelled"],
+  ["interrupted", "interrupted"],
+  // Discarded work is not a cancellation the user asked for, but it did stop.
+  ["rolled_back", "interrupted"],
+]);
+
+const ACTIVE_SUBAGENT_STATUSES: ReadonlySet<OrchestrationV2Subagent["status"]> = new Set([
+  "pending",
+  "running",
+  "waiting",
+]);
+
+/**
+ * Settles subagents whose run already ended.
+ *
+ * A provider-native subagent advances only when its provider emits an event for
+ * that native task. When the turn ends without one — killed process, dropped
+ * native payload, cancelled run — the row keeps `running` forever: the panel
+ * shows a live agent on a finished turn, `0/1 settled` never resolves, and the
+ * elapsed counter runs for hours because `completedAt` stays null. Measured on
+ * a real thread: 21 such rows, every one with `parent_node_status` and
+ * `parent_run_status` already terminal.
+ *
+ * A terminal run cannot emit more events for its subagents, so they are settled
+ * here rather than left to time out. Delegated subagents (`childThreadId`) are
+ * exempt: a child thread outlives the parent run that launched it.
+ */
+export function settleSubagentsOfTerminalRuns(projection: {
+  readonly runs?: ReadonlyArray<{
+    readonly id: string;
+    readonly status: string;
+    readonly completedAt: DateTime.Utc | null;
+  }>;
+  readonly nodes?: ReadonlyArray<{ readonly id: string; readonly runId: string | null }>;
+  readonly subagents: ReadonlyArray<OrchestrationV2Subagent>;
+}): ReadonlyArray<OrchestrationV2Subagent> {
+  const runs = projection.runs ?? [];
+  const runsById = new Map(runs.map((run) => [run.id, run]));
+  const runIdByNode = new Map(
+    (projection.nodes ?? []).map((node) => [node.id, node.runId] as const),
+  );
+  const subagentsById = new Map(projection.subagents.map((subagent) => [subagent.id, subagent]));
+
+  // A workflow member hangs off its coordinator subagent, which hangs off the
+  // run's root node, so the owning run is found by walking up the chain.
+  const runOf = (
+    subagent: OrchestrationV2Subagent,
+    seen: ReadonlySet<string> = new Set(),
+  ): (typeof runs)[number] | null => {
+    if (subagent.runId !== null) return runsById.get(subagent.runId) ?? null;
+    const viaNode = runIdByNode.get(subagent.parentNodeId);
+    if (viaNode != null) return runsById.get(viaNode) ?? null;
+    const parent = subagentsById.get(subagent.parentNodeId);
+    if (parent === undefined || seen.has(parent.id)) return null;
+    return runOf(parent, new Set([...seen, subagent.id]));
+  };
+
+  return projection.subagents.map((subagent) => {
+    if (!ACTIVE_SUBAGENT_STATUSES.has(subagent.status) || subagent.childThreadId !== null) {
+      return subagent;
+    }
+    const run = runOf(subagent);
+    const settledStatus = run === null ? undefined : TERMINAL_RUN_STATUSES.get(run.status);
+    if (run === null || settledStatus === undefined) return subagent;
+    const settledAt = run.completedAt ?? subagent.updatedAt;
+    return {
+      ...subagent,
+      status: settledStatus,
+      completedAt: subagent.completedAt ?? settledAt,
+      updatedAt: subagent.updatedAt,
+    };
+  });
+}
+
 /**
  * Projects orchestration-v2 subagent entities into the runtime shape the web
  * and mobile agent rows render. A subagent carrying the provider-workflow

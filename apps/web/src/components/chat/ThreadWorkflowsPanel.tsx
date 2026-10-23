@@ -8,6 +8,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   isTerminalSubagentStatus,
   projectedSubagentsToRuntime,
+  settleSubagentsOfTerminalRuns,
   type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import {
@@ -168,9 +169,22 @@ export function ThreadWorkflowsPanel(props: {
 }) {
   const projection =
     useThreadProjection(scopeThreadRef(props.environmentId, props.threadId))?.projection ?? null;
+  // A provider that never reported a subagent's end leaves it `running` after
+  // its run is done; the panel shows a live agent on a finished workflow.
+  const subagents = useMemo(
+    () =>
+      projection === null
+        ? []
+        : settleSubagentsOfTerminalRuns({
+            runs: projection.runs,
+            nodes: projection.nodes,
+            subagents: projection.subagents,
+          }),
+    [projection],
+  );
   const model = useMemo(
-    () => deriveAgentPanelModel(projectedSubagentsToRuntime(projection?.subagents ?? [])),
-    [projection?.subagents],
+    () => deriveAgentPanelModel(projectedSubagentsToRuntime(subagents)),
+    [subagents],
   );
   if (model.workflows.length === 0) {
     return null;

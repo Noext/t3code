@@ -76,6 +76,7 @@ import {
   isThreadHistoryTurnStart,
   THREAD_HISTORY_MAX_RAW_TURNS,
 } from "./threadHistoryPaging.ts";
+import { settleSubagentsOfEndedRuns } from "./settledSubagents.ts";
 
 export class ProjectionStoreApplyEventError extends Schema.TaggedError<ProjectionStoreApplyEventError>()(
   "ProjectionStoreApplyEventError",
@@ -3180,6 +3181,50 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           decodeRows(decodeContextHandoffPayload, threadId)(contextHandoffRows),
           decodeRows(decodeContextTransferPayload, threadId)(contextTransferRows),
         ]);
+        // A subagent whose provider never reported an end stays `running` after
+        // its run is terminal. Resolve it from the store rather than from the
+        // arrays above: this read is windowed, and the run owning a stale row is
+        // usually outside the window.
+        const endedRunRows = yield* sql<{
+          subagent_id: string;
+          run_status: string;
+          completed_at: string | null;
+        }>`
+          WITH RECURSIVE
+            seed(subagent_id, node_id) AS (
+              SELECT subagent_id, parent_node_id
+              FROM orchestration_v2_projection_subagents
+              WHERE thread_id = ${threadId}
+                AND status IN ('pending', 'running', 'waiting')
+                AND child_thread_id IS NULL
+                AND run_id IS NULL
+            ),
+            walk(subagent_id, node_id) AS (
+              SELECT seed.subagent_id, seed.node_id FROM seed
+              UNION
+              SELECT walk.subagent_id, parent.parent_node_id
+              FROM walk
+              INNER JOIN orchestration_v2_projection_subagents AS parent
+                ON parent.subagent_id = walk.node_id
+            ),
+            owning(subagent_id, run_id) AS (
+              SELECT subagent_id, run_id
+              FROM orchestration_v2_projection_subagents
+              WHERE thread_id = ${threadId}
+                AND status IN ('pending', 'running', 'waiting')
+                AND child_thread_id IS NULL
+                AND run_id IS NOT NULL
+              UNION
+              SELECT walk.subagent_id, nodes.run_id
+              FROM walk
+              INNER JOIN orchestration_v2_projection_nodes AS nodes ON nodes.node_id = walk.node_id
+            )
+          SELECT owning.subagent_id, runs.status AS run_status, runs.completed_at
+          FROM owning
+          INNER JOIN orchestration_v2_projection_runs AS runs ON runs.run_id = owning.run_id
+          WHERE runs.status IN ('completed', 'failed', 'cancelled', 'interrupted', 'rolled_back')
+        `;
+        const settledSubagents = settleSubagentsOfEndedRuns(subagents, endedRunRows);
         // A metadata read must preserve message ordering without decoding tool output.
         const messageOrdinals = new Map<string, number>();
         if (fields !== undefined && fields.includes("messages") && messages.length > 1) {
@@ -3197,7 +3242,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           runs,
           attempts,
           nodes,
-          subagents,
+          subagents: settledSubagents,
           providerSessions,
           providerThreads,
           providerTurns,
