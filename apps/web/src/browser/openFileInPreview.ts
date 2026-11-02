@@ -17,14 +17,20 @@ import { AsyncResult } from "effect/reactivity";
 
 import { resolveAssetUrl } from "~/assets/assetUrls";
 import { isPreviewAvailableFor, previewRuntimeFor } from "~/browser/previewRuntime";
-import { applyPreviewServerSnapshot, rememberPreviewUrl } from "~/previewStateStore";
-import { useRightPanelStore } from "~/rightPanelStore";
-
 import {
-  browserDefaultOpenProfileId,
-  browserDefaultOpenViewport,
-  resolveBrowserDefaults,
-} from "./browserDefaults";
+  applyPreviewServerSnapshot,
+  readThreadPreviewState,
+  rememberPreviewUrl,
+  setActivePreviewTab,
+  updatePreviewServerSnapshot,
+} from "~/previewStateStore";
+import {
+  rightPanelHostRef,
+  selectSelectedRightPanelSurface,
+  useRightPanelStore,
+} from "~/rightPanelStore";
+
+import { resolveBrowserDefaults } from "./browserDefaults";
 
 export const isBrowserPreviewFile = (path: string): boolean =>
   /\.(?:html?|pdf)$/i.test(path.split(/[?#]/, 1)[0] ?? "");
@@ -52,38 +58,53 @@ export async function openUrlInPreview<E>(input: {
   readonly threadRef: ScopedThreadRef;
   readonly url: string;
   readonly openPreview: OpenPreviewMutation<E>;
+  readonly profileId?: PreviewOpenInput["profileId"];
+  readonly background?: boolean;
 }): Promise<AtomCommandResult<void, E | BrowserSettingsReadError>> {
+  // Read before any await: a side chat pane that unmounts meanwhile drops its host mapping.
+  const threadRef = rightPanelHostRef(input.threadRef);
   const defaults = await resolveBrowserDefaults().catch(
     (cause: unknown) => new BrowserSettingsReadError({ cause }),
   );
   if (defaults instanceof BrowserSettingsReadError) {
     return AsyncResult.failure(Cause.fail(defaults));
   }
-  const runtime = previewRuntimeFor(input.threadRef.environmentId);
+  const runtime = previewRuntimeFor(threadRef.environmentId);
+  const previousActiveTabId = readThreadPreviewState(threadRef).activeTabId;
+  // The server changes the active tab, not panel selection; selection changes come from the user.
+  const selectedSurface = () =>
+    selectSelectedRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef)?.id ??
+    null;
+  const surfaceBeforeOpen = selectedSurface();
   const result = await input.openPreview({
-    environmentId: input.threadRef.environmentId,
+    environmentId: threadRef.environmentId,
     input: {
-      threadId: input.threadRef.threadId,
+      threadId: threadRef.threadId,
       url: input.url,
-      // Built here rather than via `openPreviewSession` because this path
-      // maps the result differently, so the configured defaults have to be
-      // applied explicitly or file/link opens would ignore them.
-      viewport: browserDefaultOpenViewport(defaults),
-      profileId: browserDefaultOpenProfileId(defaults),
+      viewport: defaults.viewport,
+      profileId: input.profileId ?? defaults.profileId,
       ...(runtime === undefined ? {} : { runtime }),
     },
   });
   return mapAtomCommandResult(result, (snapshot) => {
-    applyPreviewServerSnapshot(input.threadRef, snapshot);
-    rememberPreviewUrl(input.threadRef, input.url);
-    useRightPanelStore.getState().openBrowser(input.threadRef, snapshot.tabId);
+    rememberPreviewUrl(threadRef, input.url);
+    if (input.background) {
+      updatePreviewServerSnapshot(threadRef, snapshot);
+      // Restore focus unless the user picked a tab while opening this one.
+      if (
+        previousActiveTabId &&
+        readThreadPreviewState(threadRef).activeTabId === snapshot.tabId &&
+        selectedSurface() === surfaceBeforeOpen
+      ) {
+        setActivePreviewTab(threadRef, previousActiveTabId);
+      }
+      return;
+    }
+    applyPreviewServerSnapshot(threadRef, snapshot);
+    useRightPanelStore.getState().openBrowser(threadRef, snapshot.tabId);
   });
 }
 
-/**
- * Opens a browser document in the integrated browser. Inside the workspace the
- * page may load sibling assets; a file outside it is served on its own.
- */
 export async function openFileInPreview<AssetError, PreviewError>(input: {
   readonly threadRef: ScopedThreadRef;
   readonly filePath: string;
@@ -109,6 +130,7 @@ export async function openFileInPreview<AssetError, PreviewError>(input: {
       ),
     );
   }
+  const hostRef = rightPanelHostRef(input.threadRef);
   const insideWorkspace =
     mediaFileReference(input.filePath, input.workspaceRoot).relativePath !== undefined;
   const assetResult = await input.createAssetUrl({
@@ -131,7 +153,7 @@ export async function openFileInPreview<AssetError, PreviewError>(input: {
     );
   }
   return openUrlInPreview({
-    threadRef: input.threadRef,
+    threadRef: hostRef,
     url: assetUrl,
     openPreview: input.openPreview,
   });

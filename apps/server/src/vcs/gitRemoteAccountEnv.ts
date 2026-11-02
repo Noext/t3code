@@ -1,7 +1,10 @@
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 
-import { GitHubCredentials, isGitHubDotCom } from "../sourceControl/GitHubCredentials.ts";
+import {
+  GitHubCredentials,
+  isGitHubDotCom,
+} from "@t3tools/source-control-github/server/credentials";
 
 /**
  * Subcommands that can send a request to a remote repository. Local reads (`status`, `rev-parse`,
@@ -38,7 +41,7 @@ export interface GitRemoteCommand {
 }
 
 /** The subcommand and operands of a git command that can reach a remote, or null when it cannot. */
-export function gitRemoteCommand(args: ReadonlyArray<string>): GitRemoteCommand | null {
+function gitRemoteCommand(args: ReadonlyArray<string>): GitRemoteCommand | null {
   let index = 0;
   while (index < args.length) {
     const arg = args[index]!;
@@ -66,7 +69,7 @@ export function gitRemoteCommand(args: ReadonlyArray<string>): GitRemoteCommand 
 }
 
 /** True for a token git reads as a repository location: a scheme URL or the `user@host:path` form. */
-export function isRepositoryUrl(token: string): boolean {
+function isRepositoryUrl(token: string): boolean {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(token) || /^[^\s/@]+@[^\s/:]+:/.test(token);
 }
 
@@ -75,7 +78,7 @@ export function isRepositoryUrl(token: string): boolean {
  * Only `https` is answered: that is the scheme a credential helper is registered for, so ssh and
  * local paths authenticate some other way and a token would change nothing.
  */
-export function httpsRepositoryOwner(
+function httpsRepositoryOwner(
   url: string,
 ): { readonly host: string; readonly owner: string } | null {
   if (!/^https:\/\//i.test(url)) return null;
@@ -114,7 +117,7 @@ function remoteUrlFor(
  * never given to a host the URL chose for itself. `GH_DEBUG` is cleared because `gh` prints request
  * headers, and with them the token, under debug output.
  */
-export function credentialEnvironment(host: string, token: string): NodeJS.ProcessEnv {
+function credentialEnvironment(host: string, token: string): NodeJS.ProcessEnv {
   if (isGitHubDotCom(host)) return { GH_DEBUG: "", GH_TOKEN: token, GITHUB_TOKEN: token };
   return {
     GH_DEBUG: "",
@@ -125,17 +128,10 @@ export function credentialEnvironment(host: string, token: string): NodeJS.Proce
 }
 
 /**
- * The environment a git process needs to reach the repository it was asked for through the account
- * that owns it.
- *
- * Git authenticates through a credential helper, and the helper `gh auth setup-git` installs always
- * answers as the account active in `gh`. A repository owned by a second signed-in account therefore
- * looks missing. `GH_TOKEN` makes the helper use that account for this process only: it switches no
- * account — a global mutation that would corrupt a command running for the other owner — and writes
- * no credential into a git config file.
- *
- * Everything unresolved yields an empty environment: the command then runs with the account the
- * machine is already using, exactly as it did before.
+ * The environment a git process needs to reach its remote as the account the user configured for that
+ * host. The `gh auth setup-git` helper answers as the active login, so a repository owned by another
+ * signed-in account looks missing; `GH_TOKEN` switches accounts for this process only.
+ * Everything unresolved yields an empty environment, leaving the machine's own auth.
  */
 export const gitRemoteAccountEnv = Effect.fn("gitRemoteAccountEnv")(function* (input: {
   readonly args: ReadonlyArray<string>;
