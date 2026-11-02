@@ -3,8 +3,9 @@ import { INCOGNITO_BROWSER_PROFILE_ID } from "@t3tools/contracts";
 import { constVoid } from "effect/Function";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeModule from "node:module";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import type { Browser, BrowserContext } from "playwright-core";
+import type { Browser, BrowserContext, CDPSession } from "playwright-core";
 
 import { sandboxDisabled } from "./PreviewBrowserHost.ts";
 
@@ -15,19 +16,67 @@ const loadPlaywright = () =>
 
 interface Options {
   readonly profilesDir: string;
-  /** The shared headless browser's executable, installing it on first use. */
   readonly executable: () => Promise<string>;
-  /** Replaces a failed launch's error with the host setup it is missing, if any. */
+  /**
+   * A path that starts `executable`, such as one that moves Chrome out of the server's cgroup.
+   * Released after the whole launch call, since Playwright retries the same path after a glibc race.
+   */
+  readonly launcher?: (
+    executable: string,
+  ) => Promise<{ readonly path: string; readonly release: () => Promise<void> } | undefined>;
   readonly diagnose?: (executable: string, cause: unknown) => Promise<unknown>;
   readonly env?: NodeJS.ProcessEnv;
   readonly onContextClose?: (context: BrowserContext) => void;
 }
 
-/** Persistent human profiles keep their storage; isolated agents share a browser, never a context. */
+const UA_PLATFORMS: Partial<Record<NodeJS.Platform, string>> = {
+  darwin: "macOS",
+  linux: "Linux",
+  win32: "Windows",
+};
+
+/** Change user agent and Sec-CH-UA together; sites block mismatches. */
+const chromeIdentity = (
+  headlessUserAgent: string,
+  host: { readonly platform: NodeJS.Platform; readonly arch: string; readonly release: string },
+) => {
+  const version = /HeadlessChrome\/((\d+)[\d.]*)/.exec(headlessUserAgent);
+  const fullVersion = version?.[1];
+  const major = version?.[2];
+  if (!version || !fullVersion || !major) return null;
+  const brands = (names: (version: string) => string) => [
+    { brand: "Chromium", version: names(major) },
+    { brand: "Google Chrome", version: names(major) },
+    { brand: "Not A(Brand", version: names("99") },
+  ];
+  return {
+    userAgent: headlessUserAgent.replace(version[0], `Chrome/${major}.0.0.0`),
+    userAgentMetadata: {
+      brands: brands((value) => value),
+      fullVersionList: brands((value) => (value === major ? fullVersion : `${value}.0.0.0`)),
+      platform: UA_PLATFORMS[host.platform] ?? "Unknown",
+      platformVersion: host.platform === "linux" ? host.release : "",
+      architecture: host.arch.startsWith("arm") ? "arm" : "x86",
+      bitness: host.arch.endsWith("64") ? "64" : "32",
+      model: "",
+      mobile: false,
+      wow64: false,
+    },
+  };
+};
+
+export const presentAsChrome = async (
+  cdp: CDPSession,
+  host: { readonly platform: NodeJS.Platform; readonly arch: string },
+) => {
+  const { userAgent } = await cdp.send("Browser.getVersion");
+  const identity = chromeIdentity(userAgent, { ...host, release: NodeOS.release() });
+  if (identity) await cdp.send("Emulation.setUserAgentOverride", identity);
+};
+
 export class ServerBrowserContexts {
   private readonly options: Options;
   private readonly contexts = new Map<string, Promise<BrowserContext>>();
-  /** Profile clears in progress; a context for that profile opens after its storage is gone. */
   private readonly clearing = new Map<string, Promise<void>>();
   private browser: Promise<Browser> | undefined;
   private closing: Promise<void> | undefined;
@@ -37,31 +86,43 @@ export class ServerBrowserContexts {
   }
 
   private async launchOptions() {
-    const executablePath = await this.options.executable();
+    const executable = await this.options.executable();
     const env = this.options.env ?? process.env;
     return {
-      executablePath,
+      executable,
       env,
-      args: ["--disable-gpu", "--force-device-scale-factor=2"],
+      args: [
+        "--disable-gpu",
+        "--force-device-scale-factor=2",
+        "--disable-blink-features=AutomationControlled",
+      ],
+      ignoreDefaultArgs: ["--enable-automation"],
       headless: true,
       // Only an explicit operator opt-out disables sandboxing. Launch errors never do.
       chromiumSandbox: !sandboxDisabled(env),
     };
   }
 
-  private async launch<A>(options: { readonly executablePath: string }, start: () => Promise<A>) {
+  private async launch<A>(executable: string, start: (executablePath: string) => Promise<A>) {
+    let release: (() => Promise<void>) | undefined;
     try {
-      return await start();
+      const launcher = await this.options.launcher?.(executable);
+      release = launcher?.release;
+      return await start(launcher?.path ?? executable);
     } catch (cause) {
-      throw (await this.options.diagnose?.(options.executablePath, cause)) ?? cause;
+      throw (await this.options.diagnose?.(executable, cause)) ?? cause;
+    } finally {
+      await release?.().catch(constVoid);
     }
   }
 
   private sharedBrowser() {
     if (!this.browser) {
-      const launched = this.launchOptions().then(async (options) => {
+      const launched = this.launchOptions().then(async ({ executable, ...options }) => {
         const { chromium } = loadPlaywright();
-        const browser = await this.launch(options, () => chromium.launch(options));
+        const browser = await this.launch(executable, (executablePath) =>
+          chromium.launch({ ...options, executablePath }),
+        );
         browser.on("disconnected", () => {
           if (this.browser === launched) this.browser = undefined;
         });
@@ -109,11 +170,15 @@ export class ServerBrowserContexts {
       return browser.newContext(contextOptions);
     }
     const directory = this.profileDirectory(profileId);
-    const options = await this.launchOptions();
-    const { chromium } = loadPlaywright();
     await NodeFSP.mkdir(directory, { recursive: true });
-    return this.launch(options, () =>
-      chromium.launchPersistentContext(directory, { ...options, ...contextOptions }),
+    const { executable, ...options } = await this.launchOptions();
+    const { chromium } = loadPlaywright();
+    return this.launch(executable, (executablePath) =>
+      chromium.launchPersistentContext(directory, {
+        ...options,
+        ...contextOptions,
+        executablePath,
+      }),
     );
   }
 
@@ -125,7 +190,6 @@ export class ServerBrowserContexts {
     );
   }
 
-  /** A throwaway page in the shared browser, for work that must not touch a tab's own storage. */
   async scratchPage() {
     if (this.closing) throw new Error("The preview browser is closed.");
     const context = await (await this.sharedBrowser()).newContext();
@@ -134,10 +198,6 @@ export class ServerBrowserContexts {
     return page;
   }
 
-  /**
-   * Drives a page the desktop app renders, through the CDP endpoint its relay
-   * serves. The page keeps the desktop's storage, size, and window.
-   */
   async connectDesktopPage(endpoint: string) {
     const { chromium } = loadPlaywright();
     const browser = await chromium.connectOverCDP(endpoint, { timeout: 15_000 });
@@ -149,10 +209,11 @@ export class ServerBrowserContexts {
     return { browser, page };
   }
 
-  /** Closes a human profile's persistent context, ending its tabs, then deletes its storage. */
   async clearProfile(profileId: string) {
     if (profileId === INCOGNITO_BROWSER_PROFILE_ID) return;
     const key = JSON.stringify([profileId, null]);
+    const existing = this.clearing.get(key);
+    if (existing) return existing;
     const clearing = (async () => {
       const pending = this.contexts.get(key);
       if (pending) {

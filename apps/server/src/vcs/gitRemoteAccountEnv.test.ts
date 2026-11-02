@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - the fake `gh`/`git` shims are written to a real temp dir.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -8,10 +9,8 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 
 import { ServerConfig } from "../config.ts";
-import * as GitHubCredentials from "../sourceControl/GitHubCredentials.ts";
-import * as ServerSettings from "../serverSettings.ts";
+import * as GitHubCredentials from "@t3tools/source-control-github/server/credentials";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
-import * as VcsProcess from "./VcsProcess.ts";
 import { gitRemoteAccountEnv } from "./gitRemoteAccountEnv.ts";
 
 const NOEXT_URL = "https://github.com/Noext/trackshop.git";
@@ -32,6 +31,9 @@ const signedInAccounts = (tokens: Readonly<Record<string, string>>) =>
             fingerprint: `fingerprint:${token}`,
           });
     },
+    // The policy under test only reads `get`; the rest of the service is unreachable here.
+    saved: () => Effect.succeedNone,
+    fingerprint: (_host: string, token: string) => Effect.succeed(`fingerprint:${token}`),
     invalidate: () => Effect.void,
   }) satisfies GitHubCredentials.GitHubCredentials["Service"];
 
@@ -305,10 +307,9 @@ const TestLayer = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfigLayer),
   Layer.provideMerge(NodeServices.layer),
   Layer.provide(
-    GitHubCredentials.layer.pipe(
-      Layer.provide(VcsProcess.layer),
-      Layer.provide(ServerSettings.ServerSettingsService.layerTest({})),
-      Layer.provide(NodeServices.layer),
+    Layer.succeed(
+      GitHubCredentials.GitHubCredentials,
+      signedInAccounts({ noext: "token-noext", "maxime-pharmania": "token-maxime" }),
     ),
   ),
 );
