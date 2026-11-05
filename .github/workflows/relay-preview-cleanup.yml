@@ -11,8 +11,6 @@ name: Clean up relay preview
 on:
   pull_request_target:
     types: [unlabeled, closed]
-  schedule:
-    - cron: "17 7 * * *"
   workflow_dispatch:
 
 permissions:
